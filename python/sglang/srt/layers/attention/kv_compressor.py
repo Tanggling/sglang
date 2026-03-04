@@ -310,8 +310,8 @@ class SnapKVStyleCompressor(BaseKVCompressor):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compress KV cache using SnapKV-style algorithm."""
         seq_len = k.shape[0]
-        num_heads = k.shape[1]
-        head_dim = k.shape[2]
+        num_kv_heads = k.shape[1]
+        kv_head_dim = k.shape[2]
         
         num_tokens_to_keep = max(
             self.config.min_tokens_to_keep,
@@ -321,38 +321,49 @@ class SnapKVStyleCompressor(BaseKVCompressor):
         window_size = min(self.config.window_size, seq_len)
         
         if attention_scores is None and query is not None:
+            num_heads = query.shape[1]
+            q_head_dim = query.shape[2]
+            kv_group_num = num_heads // num_kv_heads
+            
             q_window = query[-window_size:]
-            k_window = k[-window_size:]
+            k_prefix = k[:-window_size]
             
-            q_t = q_window.transpose(0, 1)
-            k_t = k_window.transpose(0, 1)
-            
-            attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / math.sqrt(head_dim)
-            
-            causal_mask = torch.triu(
-                torch.ones(window_size, window_size, dtype=torch.bool, device=k.device),
-                diagonal=1
-            )
-            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
-            attention_scores = F.softmax(attn_weights, dim=-1)
-        
-        if attention_scores is not None:
-            if attention_scores.dim() == 3:
-                importance = attention_scores.mean(dim=0)
+            if k_prefix.shape[0] == 0:
+                importance_pooled = torch.ones(seq_len, device=k.device)
             else:
-                importance = attention_scores
-            
-            importance = importance.mean(dim=0)
-            
-            if importance.shape[0] > self.kernel_size:
-                importance_pooled = F.avg_pool1d(
-                    importance.unsqueeze(0).unsqueeze(0),
-                    kernel_size=self.kernel_size,
-                    stride=1,
-                    padding=self.kernel_size // 2
-                ).squeeze()
-            else:
-                importance_pooled = importance
+                q_t = q_window.transpose(0, 1)
+                k_t = k_prefix.transpose(0, 1)
+                
+                if kv_group_num > 1:
+                    k_t = k_t.repeat_interleave(kv_group_num, dim=0)
+                
+                attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
+                
+                attention_scores = F.softmax(attn_weights, dim=-1)
+                
+                if attention_scores.dim() == 3:
+                    importance = attention_scores.mean(dim=0)
+                else:
+                    importance = attention_scores
+                
+                importance = importance.mean(dim=0)
+                
+                if importance.shape[0] > self.kernel_size:
+                    importance_pooled = F.avg_pool1d(
+                        importance.unsqueeze(0).unsqueeze(0),
+                        kernel_size=self.kernel_size,
+                        stride=1,
+                        padding=self.kernel_size // 2
+                    ).squeeze()
+                else:
+                    importance_pooled = importance
+                
+                full_importance = torch.zeros(seq_len - window_size, device=k.device)
+                full_importance[:importance_pooled.shape[0]] = importance_pooled
+                importance_pooled = torch.cat([
+                    full_importance,
+                    torch.zeros(window_size, device=k.device)
+                ])
         else:
             importance_pooled = torch.ones(seq_len, device=k.device)
         
