@@ -368,6 +368,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For KV cache compression
+    kv_compressed_lens: Optional[List[int]] = None
+
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 

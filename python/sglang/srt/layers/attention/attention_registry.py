@@ -177,6 +177,23 @@ def create_dual_chunk_flash_attn_backend(runner):
     return DualChunkFlashAttentionBackend(runner)
 
 
+@register_attention_backend("compressed_fa3")
+def create_compressed_flashattention_backend(runner):
+    import torch
+
+    assert (
+        torch.cuda.get_device_capability()[0] >= 8 and not runner.use_mla_backend
+    ), (
+        "Compressed FlashAttention Backend requires SM>=80 and non-MLA models. "
+        "Please use `--attention-backend flashinfer`."
+    )
+    from sglang.srt.layers.attention.compressed_flashattention_backend import (
+        CompressedFlashAttentionBackend,
+    )
+
+    return CompressedFlashAttentionBackend(runner)
+
+
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
     """
     Wrapper for special models like hybrid GDN, so we don't

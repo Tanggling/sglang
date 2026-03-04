@@ -144,6 +144,9 @@ class SchedulerOutputProcessorMixin:
                 result.extend_logprob_start_len_per_req,
             )
 
+            # Handle KV cache compression results
+            kv_compressed_lens = result.kv_compressed_lens
+
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
@@ -165,6 +168,10 @@ class SchedulerOutputProcessorMixin:
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
                     continue
+
+                # Update kv_committed_len if KV cache was compressed
+                if kv_compressed_lens is not None and kv_compressed_lens[i] is not None:
+                    req.kv_committed_len = kv_compressed_lens[i]
 
                 if req.is_chunked <= 0:
                     if req.time_stats.prefill_finished_ts == 0.0:

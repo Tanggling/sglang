@@ -34,6 +34,9 @@ class GenerationBatchResult:
     extend_input_len_per_req: Optional[List[int]] = None
     extend_logprob_start_len_per_req: Optional[List[int]] = None
 
+    # For KV cache compression
+    kv_compressed_lens: Optional[List[int]] = None
+
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None

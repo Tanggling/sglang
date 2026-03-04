@@ -757,6 +757,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
 
+        # Skip validation if disable_context_len_check is enabled
+        if self.server_args.disable_context_len_check:
+            return
+
         # Validate input length
         if input_token_num >= self.context_len:
             if self.server_args.allow_auto_truncate:

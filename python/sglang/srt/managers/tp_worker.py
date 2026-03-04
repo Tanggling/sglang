@@ -506,6 +506,10 @@ class TpModelWorker(BaseTpWorker):
                         logits_output, model_worker_batch
                     )
 
+            # Pass KV compressed lengths from forward_batch to batch_result
+            if forward_batch.kv_compressed_lens is not None:
+                batch_result.kv_compressed_lens = forward_batch.kv_compressed_lens
+
             return batch_result
         else:
             out = self.model_runner.forward(

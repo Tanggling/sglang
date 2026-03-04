@@ -134,6 +134,7 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    "compressed_fa3",
     # AMD specific
     "aiter",
     "wave",
@@ -619,6 +620,7 @@ class ServerArgs:
     enable_weights_cpu_backup: bool = False
     enable_draft_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
+    disable_context_len_check: bool = False
     enable_custom_logit_processor: bool = False
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
@@ -4697,6 +4699,11 @@ class ServerArgs:
             "--allow-auto-truncate",
             action="store_true",
             help="Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
+        )
+        parser.add_argument(
+            "--disable-context-len-check",
+            action="store_true",
+            help="Disable context length validation. This allows requests to exceed the model's maximum context length. Useful for KV cache compression scenarios.",
         )
         parser.add_argument(
             "--enable-custom-logit-processor",
