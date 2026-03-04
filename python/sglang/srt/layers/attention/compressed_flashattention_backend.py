@@ -147,12 +147,17 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         3. Updates req_to_token mapping for each request
         4. Frees unused cache slots
         
-        Note: q, k, v have shape [total_tokens, num_heads, head_dim]
+        Note: 
+        - q has shape [total_tokens, num_heads * head_dim] (flattened)
+        - k, v have shape [total_tokens, num_kv_heads, head_dim]
         """
         layer_id = layer.layer_id
         num_heads = layer.tp_q_head_num
         num_kv_heads = layer.tp_k_head_num
         head_dim = layer.head_dim
+        
+        # Reshape q from [total_tokens, num_heads * head_dim] to [total_tokens, num_heads, head_dim]
+        q = q.view(-1, num_heads, head_dim)
         
         metadata = self.forward_metadata
         cu_seqlens_q = metadata.cu_seqlens_q
