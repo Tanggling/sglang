@@ -130,10 +130,17 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         should_compress = self.compressor.should_compress(layer_id, total_tokens)
         
         if should_compress and save_kv_cache:
-            self._compress_kv_cache_after_attention(
-                q, k, v, layer, forward_batch, **kwargs
-            )
-        
+            # Layer 1: perform full compression
+            if layer_id == 1:
+                self._compress_kv_cache_after_attention(
+                    q, k, v, layer, forward_batch, **kwargs
+                )
+            # Layer > 1: reuse layer 1's compressed indices
+            elif layer_id > 1:
+                # self._compress_kv_cache_reuse_layer1_indices(
+                #     q, k, v, layer, forward_batch, **kwargs
+                # )
+                pass        
         return output
     
     def _compress_kv_cache_after_attention(
@@ -196,8 +203,8 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             q_seq = q[start_idx:end_idx]
             k_seq = k[start_idx:end_idx]
             v_seq = v[start_idx:end_idx]
-
-            print(f"Processing sequence {seq_idx}: length={seq_len}, q_seq shape={q_seq.shape}, k_seq shape={k_seq.shape}, v_seq shape={v_seq.shape}")
+            print(f"cu_seqlens_q[{seq_idx}] = {cu_seqlens_q[seq_idx].item()}")
+            # print(f"Processing sequence {seq_idx}: length={seq_len}, q_seq shape={q_seq.shape}, k_seq shape={k_seq.shape}, v_seq shape={v_seq.shape}")
 
             compressed_k_seq, compressed_v_seq, keep_indices = self._estimate_importance(
                 method=self.importance_method,
