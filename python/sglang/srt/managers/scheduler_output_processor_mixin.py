@@ -171,12 +171,14 @@ class SchedulerOutputProcessorMixin:
 
                 # Update kv_committed_len and kv_allocated_len if KV cache was compressed
                 if kv_compressed_lens is not None and kv_compressed_lens[i] is not None:
+                    print(f"Request {req.rid} had KV cache compressed to length {kv_compressed_lens[i]}")
                     req.kv_committed_len = kv_compressed_lens[i]
                     req.kv_allocated_len = kv_compressed_lens[i]
                     # Update batch seq_lens to reflect compressed KV cache length
                     # This ensures prepare_for_decode uses the correct length
-                    batch.seq_lens[i] = kv_compressed_lens[i]
-                    batch.seq_lens_cpu[i] = kv_compressed_lens[i]
+                    # print(f"batch.seq_lens before update: {batch.seq_lens[i]}, after update: {kv_compressed_lens[i]}")
+                    # batch.seq_lens[i] = kv_compressed_lens[i]
+                    # batch.seq_lens_cpu[i] = kv_compressed_lens[i]
 
                 if req.is_chunked <= 0:
                     if req.time_stats.prefill_finished_ts == 0.0:
@@ -287,9 +289,9 @@ class SchedulerOutputProcessorMixin:
                         auto_next_anon=True,
                     )
 
-            # Update seq_lens_sum if KV cache was compressed
-            if kv_compressed_lens is not None:
-                batch.seq_lens_sum = batch.seq_lens.sum().item()
+            # # Update seq_lens_sum if KV cache was compressed
+            # if kv_compressed_lens is not None:
+            #     batch.seq_lens_sum = batch.seq_lens.sum().item()
 
         else:  # embedding or reward model
             if result.copy_done is not None:

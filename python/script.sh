@@ -3,7 +3,7 @@ python -m sglang.launch_server \
     --port 30000 \
     --disable-cuda-graph \
     --mem-fraction-static 0.7 \
-    --attention-backend fa3 \
+    --attention-backend compressed_fa3 \
     --disable-radix-cache \
     --disable-context-len-check \
     --page-size 1 \

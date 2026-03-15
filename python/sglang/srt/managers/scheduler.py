@@ -2394,6 +2394,18 @@ class Scheduler(
                 batch_result.extend_logprob_start_len_per_req = None
 
             ret = batch_result
+            '''
+                Key-Code:
+                assign batch seq_len
+            '''
+            kv_compressed_lens = torch.Tensor(batch_result.kv_compressed_lens) if batch_result.kv_compressed_lens is not None else None
+            if kv_compressed_lens is not None:
+                print(f"kv_compressed_lens: {kv_compressed_lens}")
+                print(f"batch.seq_lens before assignment: {batch.seq_lens}, batch.seq_lens_cpu before assignment: {batch.seq_lens_cpu}")
+                batch.seq_lens = kv_compressed_lens.to(dtype=batch.seq_lens.dtype, device=batch.seq_lens.device)
+                batch.seq_lens_cpu = kv_compressed_lens.to(dtype=batch.seq_lens_cpu.dtype, device=batch.seq_lens_cpu.device)
+                batch.seq_lens_sum = batch.seq_lens.sum().item()
+                print(f"batch.seq_lens after assignment: {batch.seq_lens}, batch.seq_lens_cpu after assignment: {batch.seq_lens_cpu}")
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
 
