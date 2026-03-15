@@ -82,7 +82,10 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         self.compression_config = compression_config or CompressionConfig()
         self.compressor = create_compressor(self.compression_config)
         self.importance_method = importance_method
-        
+                    
+        # Store reference to token_to_kv_pool_allocator from runner
+        self.token_to_kv_pool_allocator = runner.token_to_kv_pool_allocator
+    
         self._compression_stats = {
             "total_compressed": 0,
             "total_freed": 0,
@@ -117,8 +120,12 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )
         
+        print(f"output shape after full attention: {output.shape}")
+
         layer_id = layer.layer_id
         
+        print(f"Layer {layer_id} forward_extend: q shape={q.shape}, k shape={k.shape}, v shape={v.shape}, output shape={output.shape}")
+
         total_tokens = q.shape[0]
         should_compress = self.compressor.should_compress(layer_id, total_tokens)
         
@@ -189,7 +196,9 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             q_seq = q[start_idx:end_idx]
             k_seq = k[start_idx:end_idx]
             v_seq = v[start_idx:end_idx]
-            
+
+            print(f"Processing sequence {seq_idx}: length={seq_len}, q_seq shape={q_seq.shape}, k_seq shape={k_seq.shape}, v_seq shape={v_seq.shape}")
+
             compressed_k_seq, compressed_v_seq, keep_indices = self._estimate_importance(
                 method=self.importance_method,
                 q=q_seq,
@@ -283,7 +292,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         
         if all_indices_to_free:
             all_freed = torch.cat(all_indices_to_free)
-            forward_batch.token_to_kv_pool_allocator.free(all_freed)
+            self.token_to_kv_pool_allocator.free(all_freed)
         
         return compressed_lens
     

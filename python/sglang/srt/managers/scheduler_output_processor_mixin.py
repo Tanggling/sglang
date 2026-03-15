@@ -169,9 +169,10 @@ class SchedulerOutputProcessorMixin:
                     # decode req in mixed batch or retracted req
                     continue
 
-                # Update kv_committed_len if KV cache was compressed
+                # Update kv_committed_len and kv_allocated_len if KV cache was compressed
                 if kv_compressed_lens is not None and kv_compressed_lens[i] is not None:
                     req.kv_committed_len = kv_compressed_lens[i]
+                    req.kv_allocated_len = kv_compressed_lens[i]
 
                 if req.is_chunked <= 0:
                     if req.time_stats.prefill_finished_ts == 0.0:

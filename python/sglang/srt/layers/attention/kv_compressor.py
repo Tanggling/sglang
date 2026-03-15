@@ -321,6 +321,7 @@ class SnapKVStyleCompressor(BaseKVCompressor):
         window_size = min(self.config.window_size, seq_len)
         
         if attention_scores is None and query is not None:
+            print(f"Query shape: {query.shape}, K shape: {k.shape}")
             num_heads = query.shape[1]
             q_head_dim = query.shape[2]
             kv_group_num = num_heads // num_kv_heads
