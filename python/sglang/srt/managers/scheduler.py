@@ -1170,6 +1170,10 @@ class Scheduler(
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
+                '''
+                    Key-Code:
+                    check memory leakage
+                '''
                 # self.self_check_during_idle()
                 pass
             

@@ -478,6 +478,9 @@ class FlashAttentionBackend(AttentionBackend):
                     self.forward_metadata_spec_decode_expand = metadata_expand
             else:
                 # Normal Decode
+                '''
+                    Key-Code
+                '''
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
                 metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
                 metadata.cu_seqlens_q = torch.arange(
