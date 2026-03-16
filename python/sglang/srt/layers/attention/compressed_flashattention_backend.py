@@ -85,6 +85,11 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                     
         # Store reference to token_to_kv_pool_allocator from runner
         self.token_to_kv_pool_allocator = runner.token_to_kv_pool_allocator
+        
+        # Store references to k_buffer and v_buffer for each layer
+        # These are used to move KV cache data after compression
+        self.k_buffer = runner.token_to_kv_pool.k_buffer
+        self.v_buffer = runner.token_to_kv_pool.v_buffer
     
         self._compression_stats = {
             "total_compressed": 0,
@@ -231,6 +236,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             all_num_to_keep=all_num_to_keep,
             all_seq_cache_locs=all_seq_cache_locs,
             batch_size=batch_size,
+            layer_id=layer_id,
         )
         
         forward_batch.kv_compressed_lens = compressed_lens
@@ -251,18 +257,22 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         all_num_to_keep: list,
         all_seq_cache_locs: list,
         batch_size: int,
+        layer_id: int = None,
     ) -> list:
         """
         Reorganize KV cache by keeping only important tokens for each sequence.
         
         This method:
-        1. Updates req_to_token mapping for each request
-        2. Frees unused cache slots
-        3. Returns the compressed lengths for each sequence
+        1. Moves KV cache data from kept positions to the beginning of seq_cache_loc
+        2. Updates req_to_token mapping for each request
+        3. Frees unused cache slots
+        4. Returns the compressed lengths for each sequence
         
-        For page_size == 1, we directly update req_to_token mapping without
-        needing to move KV cache data. The mapping points to the kept physical
-        locations which can be non-contiguous.
+        For each sequence, we move:
+        - k_buffer[layer_id][kept_cache_locs] -> k_buffer[layer_id][seq_cache_loc[:num_to_keep]]
+        - v_buffer[layer_id][kept_cache_locs] -> v_buffer[layer_id][seq_cache_loc[:num_to_keep]]
+        
+        Then update mapping to point to the new contiguous positions.
         """
         all_indices_to_free = []
         compressed_lens = []
@@ -285,23 +295,59 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             
             kept_cache_locs = seq_cache_loc[keep_local_indices]
             
+            # Move KV cache data from kept positions to the beginning of seq_cache_loc
+            # k_buffer[layer_id][kept_cache_locs] -> k_buffer[layer_id][seq_cache_loc[:num_to_keep]]
+            # v_buffer[layer_id][kept_cache_locs] -> v_buffer[layer_id][seq_cache_loc[:num_to_keep]]
+            if layer_id is not None:
+                self._move_kv_cache_data(
+                    layer_id=layer_id,
+                    src_loc=kept_cache_locs,
+                    dst_loc=seq_cache_loc[:num_to_keep],
+                )
+            
             discard_mask = torch.ones(seq_len, dtype=torch.bool, device=seq_cache_loc.device)
             discard_mask[keep_local_indices] = False
             freed_cache_locs = seq_cache_loc[discard_mask]
             
-            forward_batch.req_to_token_pool.write(
-                (req_pool_idx, slice(0, num_to_keep)),
-                kept_cache_locs,
-            )
+            if layer_id == 0:
+                # Update mapping to point to the new contiguous positions
+                forward_batch.req_to_token_pool.write(
+                    (req_pool_idx, slice(0, num_to_keep)),
+                    seq_cache_loc[:num_to_keep],
+                )
             
             compressed_lens.append(num_to_keep)
             all_indices_to_free.append(freed_cache_locs)
         
-        if all_indices_to_free:
+        if all_indices_to_free and layer_id == 0:
             all_freed = torch.cat(all_indices_to_free)
             self.token_to_kv_pool_allocator.free(all_freed)
         
         return compressed_lens
+    
+    def _move_kv_cache_data(
+        self,
+        layer_id: int,
+        src_loc: torch.Tensor,
+        dst_loc: torch.Tensor,
+    ) -> None:
+        """
+        Move KV cache data from src_loc to dst_loc for a specific layer.
+        
+        Args:
+            layer_id: The layer ID
+            src_loc: Source token locations [num_tokens]
+            dst_loc: Destination token locations [num_tokens]
+        """
+        # Get the KV buffer for this layer
+        k_buffer = self.k_buffer[layer_id]
+        v_buffer = self.v_buffer[layer_id]
+        
+        # Move key data
+        k_buffer[dst_loc] = k_buffer[src_loc]
+        
+        # Move value data
+        v_buffer[dst_loc] = v_buffer[src_loc]
     
     def _estimate_importance(
         self,
