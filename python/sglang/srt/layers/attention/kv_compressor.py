@@ -286,18 +286,20 @@ class ClusteringCompressor(BaseKVCompressor):
 
 class SnapKVStyleCompressor(BaseKVCompressor):
     """
-    SnapKV-style KV cache compressor.
+    SnapKV-style KV cache compressor with per-head compression.
     
     Implements the compression strategy from SnapKV paper:
     - Compute attention scores for recent window
-    - Select important tokens based on attention patterns
-    - Apply pooling to reduce noise
+    - Select important tokens based on attention patterns for each head
+    - Apply maxpool to reduce noise
+    - Each attention head has its own compression indices
     """
     
     def __init__(self, config: CompressionConfig):
         super().__init__(config)
         self.kernel_size = 5
-        logger.info(f"use SnapKVStyleCompressor with kernel_size={self.kernel_size}")
+        self.pooling = "maxpool"
+        logger.info(f"use SnapKVStyleCompressor with kernel_size={self.kernel_size}, pooling={self.pooling}")
     
     def compress(
         self,
@@ -308,7 +310,19 @@ class SnapKVStyleCompressor(BaseKVCompressor):
         query: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compress KV cache using SnapKV-style algorithm."""
+        """
+        Compress KV cache using SnapKV-style algorithm with per-head compression.
+        
+        Args:
+            k: Key tensor [seq_len, num_kv_heads, head_dim]
+            v: Value tensor [seq_len, num_kv_heads, head_dim]
+            query: Query tensor [seq_len, num_heads, head_dim]
+        
+        Returns:
+            compressed_k: Compressed key tensor [num_tokens_to_keep, num_kv_heads, head_dim]
+            compressed_v: Compressed value tensor [num_tokens_to_keep, num_kv_heads, head_dim]
+            keep_indices: Indices to keep per head [num_kv_heads, num_tokens_to_keep]
+        """
         seq_len = k.shape[0]
         num_kv_heads = k.shape[1]
         kv_head_dim = k.shape[2]
@@ -321,7 +335,6 @@ class SnapKVStyleCompressor(BaseKVCompressor):
         window_size = min(self.config.window_size, seq_len)
         
         if attention_scores is None and query is not None:
-            print(f"Query shape: {query.shape}, K shape: {k.shape}")
             num_heads = query.shape[1]
             q_head_dim = query.shape[2]
             kv_group_num = num_heads // num_kv_heads
@@ -330,7 +343,7 @@ class SnapKVStyleCompressor(BaseKVCompressor):
             k_prefix = k[:-window_size]
             
             if k_prefix.shape[0] == 0:
-                importance_pooled = torch.ones(seq_len, device=k.device)
+                keep_indices = torch.arange(seq_len, device=k.device).unsqueeze(0).expand(num_kv_heads, -1)
             else:
                 q_t = q_window.transpose(0, 1)
                 k_t = k_prefix.transpose(0, 1)
@@ -342,47 +355,43 @@ class SnapKVStyleCompressor(BaseKVCompressor):
                 
                 attention_scores = F.softmax(attn_weights, dim=-1)
                 
-                if attention_scores.dim() == 3:
-                    importance = attention_scores.mean(dim=0)
+                attn_weights_sum = attention_scores.sum(dim=1)
+                
+                if kv_group_num > 1:
+                    attn_weights_sum = attn_weights_sum.view(num_kv_heads, kv_group_num, -1)
+                    attn_weights_sum = attn_weights_sum.sum(dim=1)
                 else:
-                    importance = attention_scores
+                    attn_weights_sum = attn_weights_sum.view(num_kv_heads, -1)
                 
-                importance = importance.mean(dim=0)
-                
-                if importance.shape[0] > self.kernel_size:
-                    importance_pooled = F.avg_pool1d(
-                        importance.unsqueeze(0).unsqueeze(0),
-                        kernel_size=self.kernel_size,
-                        stride=1,
-                        padding=self.kernel_size // 2
-                    ).squeeze()
+                if attn_weights_sum.shape[-1] > self.kernel_size:
+                    if self.pooling == 'maxpool':
+                        attn_cache = F.max_pool1d(
+                            attn_weights_sum.unsqueeze(0),
+                            kernel_size=self.kernel_size,
+                            padding=self.kernel_size // 2,
+                            stride=1
+                        ).squeeze(0)
+                    else:
+                        attn_cache = F.avg_pool1d(
+                            attn_weights_sum.unsqueeze(0),
+                            kernel_size=self.kernel_size,
+                            padding=self.kernel_size // 2,
+                            stride=1
+                        ).squeeze(0)
                 else:
-                    importance_pooled = importance
+                    attn_cache = attn_weights_sum
                 
-                full_importance = torch.zeros(seq_len - window_size, device=k.device)
-                full_importance[:importance_pooled.shape[0]] = importance_pooled
-                importance_pooled = torch.cat([
-                    full_importance,
-                    torch.zeros(window_size, device=k.device)
-                ])
+                _, indices = attn_cache.topk(num_tokens_to_keep - window_size, dim=-1)
+                indices = torch.sort(indices, dim=-1).values
+                
+                window_indices = torch.arange(
+                    seq_len - window_size, seq_len,
+                    device=k.device
+                ).unsqueeze(0).expand(num_kv_heads, -1)
+                
+                keep_indices = torch.cat([indices, window_indices], dim=-1)
         else:
-            importance_pooled = torch.ones(seq_len, device=k.device)
-        
-        window_importance = torch.zeros(seq_len, device=k.device)
-        window_importance[-window_size:] = float('inf')
-        
-        combined_importance = importance_pooled + window_importance
-        
-        _, sorted_indices = torch.sort(combined_importance, descending=True)
-        keep_indices = sorted_indices[:num_tokens_to_keep]
-        keep_indices = torch.sort(keep_indices)[0]
-        
-        if self.config.retain_first_n_tokens > 0:
-            first_n = torch.arange(
-                min(self.config.retain_first_n_tokens, seq_len),
-                device=k.device
-            )
-            keep_indices = torch.unique(torch.cat([first_n, keep_indices]))
+            keep_indices = torch.arange(seq_len, device=k.device).unsqueeze(0).expand(num_kv_heads, -1)
         
         compressed_k = k[keep_indices]
         compressed_v = v[keep_indices]

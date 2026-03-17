@@ -225,7 +225,11 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             seq_cache_loc = cache_loc[start_idx:end_idx]
             
             all_keep_local_indices.append(keep_indices)
-            all_num_to_keep.append(keep_indices.shape[0] if keep_indices is not None else 0)
+            # For per-head compression, keep_indices shape is [num_kv_heads, num_tokens_to_keep]
+            if keep_indices is not None and keep_indices.dim() == 2:
+                all_num_to_keep.append(keep_indices.shape[1])
+            else:
+                all_num_to_keep.append(keep_indices.shape[0] if keep_indices is not None else 0)
             all_seq_cache_locs.append(seq_cache_loc)
         
         compressed_lens = self._reorganize_kv_cache_and_update_mapping(
@@ -268,11 +272,14 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         3. Frees unused cache slots
         4. Returns the compressed lengths for each sequence
         
-        For each sequence, we move:
-        - k_buffer[layer_id][kept_cache_locs] -> k_buffer[layer_id][seq_cache_loc[:num_to_keep]]
-        - v_buffer[layer_id][kept_cache_locs] -> v_buffer[layer_id][seq_cache_loc[:num_to_keep]]
+        For per-head compression:
+        - keep_local_indices shape: [num_kv_heads, num_tokens_to_keep]
+        - Each head has its own compression indices
+        - KV cache data is moved per-head
         
-        Then update mapping to point to the new contiguous positions.
+        For each sequence and each head, we move:
+        - k_buffer[layer_id][head_idx][kept_cache_locs] -> k_buffer[layer_id][head_idx][seq_cache_loc[:num_to_keep]]
+        - v_buffer[layer_id][head_idx][kept_cache_locs] -> v_buffer[layer_id][head_idx][seq_cache_loc[:num_to_keep]]
         """
         all_indices_to_free = []
         compressed_lens = []
@@ -293,37 +300,96 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             
             req_pool_idx = req_pool_indices[seq_idx].item()
             
-            kept_cache_locs = seq_cache_loc[keep_local_indices]
+            # Check if per-head compression (keep_local_indices is 2D)
+            is_per_head = keep_local_indices.dim() == 2
             
-            # Move KV cache data from kept positions to the beginning of seq_cache_loc
-            # k_buffer[layer_id][kept_cache_locs] -> k_buffer[layer_id][seq_cache_loc[:num_to_keep]]
-            # v_buffer[layer_id][kept_cache_locs] -> v_buffer[layer_id][seq_cache_loc[:num_to_keep]]
-            if layer_id is not None:
-                self._move_kv_cache_data(
-                    layer_id=layer_id,
-                    src_loc=kept_cache_locs,
-                    dst_loc=seq_cache_loc[:num_to_keep],
-                )
-            
-            discard_mask = torch.ones(seq_len, dtype=torch.bool, device=seq_cache_loc.device)
-            discard_mask[keep_local_indices] = False
-            freed_cache_locs = seq_cache_loc[discard_mask]
-            
-            if layer_id == 0:
+            if is_per_head:
+                # Per-head compression: each head has its own indices
+                num_kv_heads = keep_local_indices.shape[0]
+                
+                # Move KV cache data per-head
+                if layer_id is not None:
+                    self._move_kv_cache_data_per_head(
+                        layer_id=layer_id,
+                        keep_local_indices=keep_local_indices,
+                        seq_cache_loc=seq_cache_loc,
+                        num_to_keep=num_to_keep,
+                    )
+                
                 # Update mapping to point to the new contiguous positions
-                forward_batch.req_to_token_pool.write(
-                    (req_pool_idx, slice(0, num_to_keep)),
-                    seq_cache_loc[:num_to_keep],
-                )
+                if layer_id == 0:
+                    forward_batch.req_to_token_pool.write(
+                        (req_pool_idx, slice(0, num_to_keep)),
+                        seq_cache_loc[:num_to_keep],
+                    )
+                
+                # After moving KV cache data to seq_cache_loc[:num_to_keep],
+                # the positions to free are seq_cache_loc[num_to_keep:]
+                # because all heads share the same seq_cache_loc
+                freed_cache_locs = seq_cache_loc[num_to_keep:]
+            else:
+                # Original single-index compression
+                kept_cache_locs = seq_cache_loc[keep_local_indices]
+                
+                # Move KV cache data from kept positions to the beginning of seq_cache_loc
+                if layer_id is not None:
+                    self._move_kv_cache_data(
+                        layer_id=layer_id,
+                        src_loc=kept_cache_locs,
+                        dst_loc=seq_cache_loc[:num_to_keep],
+                    )
+                
+                # After moving, free the positions after num_to_keep
+                freed_cache_locs = seq_cache_loc[num_to_keep:]
+                
+                # Update mapping to point to the new contiguous positions
+                if layer_id == 0:
+                    forward_batch.req_to_token_pool.write(
+                        (req_pool_idx, slice(0, num_to_keep)),
+                        seq_cache_loc[:num_to_keep],
+                    )
             
             compressed_lens.append(num_to_keep)
-            all_indices_to_free.append(freed_cache_locs)
+            if freed_cache_locs.numel() > 0:
+                all_indices_to_free.append(freed_cache_locs)
         
         if all_indices_to_free and layer_id == 0:
             all_freed = torch.cat(all_indices_to_free)
             self.token_to_kv_pool_allocator.free(all_freed)
         
         return compressed_lens
+    
+    def _move_kv_cache_data_per_head(
+        self,
+        layer_id: int,
+        keep_local_indices: torch.Tensor,
+        seq_cache_loc: torch.Tensor,
+        num_to_keep: int,
+    ) -> None:
+        """
+        Move KV cache data per-head for per-head compression.
+        
+        Args:
+            layer_id: The layer ID
+            keep_local_indices: Indices to keep per head [num_kv_heads, num_tokens_to_keep]
+            seq_cache_loc: Cache locations for this sequence [seq_len]
+            num_to_keep: Number of tokens to keep per head
+        """
+        k_buffer = self.k_buffer[layer_id]
+        v_buffer = self.v_buffer[layer_id]
+        num_kv_heads = keep_local_indices.shape[0]
+        
+        # For each head, move its KV cache data
+        for head_idx in range(num_kv_heads):
+            head_keep_indices = keep_local_indices[head_idx]
+            src_locs = seq_cache_loc[head_keep_indices]
+            dst_locs = seq_cache_loc[:num_to_keep]
+            
+            # Move key data for this head
+            k_buffer[dst_locs, head_idx] = k_buffer[src_locs, head_idx]
+            
+            # Move value data for this head
+            v_buffer[dst_locs, head_idx] = v_buffer[src_locs, head_idx]
     
     def _move_kv_cache_data(
         self,
