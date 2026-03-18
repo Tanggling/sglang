@@ -135,17 +135,9 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         should_compress = self.compressor.should_compress(layer_id, total_tokens)
         
         if should_compress and save_kv_cache:
-            # Layer 1: perform full compression
-            if layer_id == 1:
-                self._compress_kv_cache_after_attention(
-                    q, k, v, layer, forward_batch, **kwargs
-                )
-            # Layer > 1: reuse layer 1's compressed indices
-            elif layer_id > 1:
-                # self._compress_kv_cache_reuse_layer1_indices(
-                #     q, k, v, layer, forward_batch, **kwargs
-                # )
-                pass        
+            self._compress_kv_cache_after_attention(
+                q, k, v, layer, forward_batch, **kwargs
+            )
         return output
     
     def _compress_kv_cache_after_attention(
