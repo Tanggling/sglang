@@ -174,11 +174,6 @@ class SchedulerOutputProcessorMixin:
                     print(f"Request {req.rid} had KV cache compressed to length {kv_compressed_lens[i]}")
                     req.kv_committed_len = kv_compressed_lens[i]
                     req.kv_allocated_len = kv_compressed_lens[i]
-                    # Update batch seq_lens to reflect compressed KV cache length
-                    # This ensures prepare_for_decode uses the correct length
-                    # print(f"batch.seq_lens before update: {batch.seq_lens[i]}, after update: {kv_compressed_lens[i]}")
-                    # batch.seq_lens[i] = kv_compressed_lens[i]
-                    # batch.seq_lens_cpu[i] = kv_compressed_lens[i]
 
                 if req.is_chunked <= 0:
                     if req.time_stats.prefill_finished_ts == 0.0:

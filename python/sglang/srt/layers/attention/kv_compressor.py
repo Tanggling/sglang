@@ -43,7 +43,7 @@ class CompressionConfig:
     
     layers_to_compress: Optional[List[int]] = None
     
-    retain_first_n_tokens: int = 16
+    retain_first_n_tokens: int = 0
     
     importance_metric: str = "attention_score"
     
@@ -353,9 +353,30 @@ class SnapKVStyleCompressor(BaseKVCompressor):
                 
                 attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
                 
-                attention_scores = F.softmax(attn_weights, dim=-1)
+                if self.apply_causal_mask:
+                    k_window = k[-window_size:]
+                    k_window_t = k_window.transpose(0, 1)
+                    if kv_group_num > 1:
+                        k_window_t = k_window_t.repeat_interleave(kv_group_num, dim=0)
+                    
+                    attn_weights_window = torch.matmul(q_t, k_window_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
+                    
+                    causal_mask = torch.triu(
+                        torch.full((window_size, window_size), float('-inf'), device=k.device, dtype=attn_weights_window.dtype),
+                        diagonal=1
+                    )
+                    attn_weights_window = attn_weights_window + causal_mask.unsqueeze(0)
+                    
+                    attn_weights_full = torch.cat([attn_weights, attn_weights_window], dim=-1)
+                    
+                    attention_scores = F.softmax(attn_weights_full, dim=-1, dtype=torch.float32).to(query.dtype)
+                    
+                    attn_weights_prefix = attention_scores[:, :, :k_prefix.shape[0]]
+                else:
+                    attention_scores = F.softmax(attn_weights, dim=-1)
+                    attn_weights_prefix = attention_scores
                 
-                attn_weights_sum = attention_scores.sum(dim=1)
+                attn_weights_sum = attn_weights_prefix.sum(dim=1)
                 
                 if kv_group_num > 1:
                     attn_weights_sum = attn_weights_sum.view(num_kv_heads, kv_group_num, -1)
