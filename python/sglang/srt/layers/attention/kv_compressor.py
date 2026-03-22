@@ -299,6 +299,7 @@ class SnapKVStyleCompressor(BaseKVCompressor):
         super().__init__(config)
         self.kernel_size = 5
         self.pooling = "maxpool"
+        self.apply_causal_mask = True
         logger.info(f"use SnapKVStyleCompressor with kernel_size={self.kernel_size}, pooling={self.pooling}")
     
     def compress(

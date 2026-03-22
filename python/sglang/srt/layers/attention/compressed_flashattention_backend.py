@@ -88,7 +88,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         )
         
         self.compression_config = compression_config or CompressionConfig()
-        self.compressor = create_compressor(self.compression_config, enable_visualization=False)
+        self.compressor = create_compressor(self.compression_config)
         self.importance_method = importance_method
         self.compression_scheme = compression_scheme
                     

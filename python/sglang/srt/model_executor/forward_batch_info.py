@@ -489,7 +489,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
-                ret.positions = clamp_position(batch.seq_lens)
+                # 压缩场景下 orig_seq_lens 保留了真实位置，seq_lens 是压缩后大小
+                pos_lens = (
+                    batch.orig_seq_lens.to(batch.seq_lens.dtype)
+                    if batch.orig_seq_lens is not None
+                    else batch.seq_lens
+                )
+                ret.positions = clamp_position(pos_lens)
         else:
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)

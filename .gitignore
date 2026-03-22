@@ -271,3 +271,12 @@ sgl-kernel/csrc/**/*_musa/
 
 # MUSA core dump files
 *.mudmp
+
+# special files
+python/example_importance_visualization.py
+python/example_tick_intervals.py
+python/sglang/.snapkv_log
+python/sglang/srt/layers/attention/IMPORTANCE_VISUALIZER_README.md
+python/sglang/srt/layers/attention/importance_visualizer.py
+python/simple_example.py
+python/test_automatic_heatmap.py
