@@ -110,7 +110,6 @@ def write_cache_indices(
         for i in range(req_pool_indices_cpu.shape[0]):
             req_idx = req_pool_indices_cpu[i].item()
             prefix_len = prefix_lens_cpu[i].item()
-            seq_len = seq_lens_cpu[i].item()
             extend_len = extend_lens_cpu[i].item()
 
             req_to_token_pool.write(
@@ -118,7 +117,7 @@ def write_cache_indices(
                 prefix_tensors[i],
             )
             req_to_token_pool.write(
-                (req_idx, slice(prefix_len, seq_len)),
+                (req_idx, slice(prefix_len, prefix_len + extend_len)),
                 out_cache_loc[pt : pt + extend_len],
             )
             pt += extend_len
@@ -354,39 +353,44 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate KV cache (throws exception on failure)
-    if batch.tree_cache.page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
-    else:
-        # Paged allocation - build last_loc
-        last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
-            for t in prefix_tensors
-        ]
-        out_cache_loc = alloc_paged_token_slots_extend(
-            tree_cache=batch.tree_cache,
-            prefix_lens=prefix_lens_device,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
-            last_loc=torch.cat(last_loc),
-            extend_num_tokens=batch.extend_num_tokens,
-        )
+    # Always allocate the full extend_len slots.
+    # The compression attention backend uses save_kv_cache=True so that FlashAttention
+    # can read complete KV for all extend tokens (including query tokens for CPU-hit reqs).
+    # After FlashAttention, the backend compresses the KV in-place, updates req_to_token,
+    # and frees the excess pool slots.
+    if True:
+        # Original path: allocate full extend tokens
+        if batch.tree_cache.page_size == 1:
+            out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        else:
+            # Paged allocation - build last_loc
+            last_loc = [
+                (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+                for t in prefix_tensors
+            ]
+            out_cache_loc = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache,
+                prefix_lens=prefix_lens_device,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=batch.extend_num_tokens,
+            )
 
-    # Write to req_to_token_pool
-    write_cache_indices(
-        out_cache_loc,
-        req_pool_indices_device,
-        req_pool_indices_cpu,
-        prefix_lens_device,
-        prefix_lens_cpu,
-        batch.seq_lens,
-        batch.seq_lens_cpu,
-        extend_lens_device,
-        extend_lens_cpu,
-        prefix_tensors,
-        batch.req_to_token_pool,
-    )
+        write_cache_indices(
+            out_cache_loc,
+            req_pool_indices_device,
+            req_pool_indices_cpu,
+            prefix_lens_device,
+            prefix_lens_cpu,
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            extend_lens_device,
+            extend_lens_cpu,
+            prefix_tensors,
+            batch.req_to_token_pool,
+        )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 

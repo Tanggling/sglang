@@ -338,6 +338,10 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
+    # KV cache compression (global/real split mode)
+    kv_compression_ratio: float = 0.0        # 0.0 = disabled; 0.5 = keep 50% of tokens
+    kv_compression_window_size: int = 64     # always keep last N tokens (not compressed)
+    kv_compression_min_tokens: int = 32      # minimum compressed sequence length
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_prefill_delayer: bool = False
@@ -3235,6 +3239,26 @@ class ServerArgs:
             type=int,
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
+        )
+        parser.add_argument(
+            "--kv-compression-ratio",
+            type=float,
+            default=ServerArgs.kv_compression_ratio,
+            help="KV cache compression ratio for the global/real split mode. "
+            "0.0 disables compression (default). 0.5 keeps 50%% of prefix tokens. "
+            "Requires --disable-radix-cache and the CompressedFlashAttentionBackend.",
+        )
+        parser.add_argument(
+            "--kv-compression-window-size",
+            type=int,
+            default=ServerArgs.kv_compression_window_size,
+            help="Number of recent tokens always kept during KV compression (not compressed).",
+        )
+        parser.add_argument(
+            "--kv-compression-min-tokens",
+            type=int,
+            default=ServerArgs.kv_compression_min_tokens,
+            help="Minimum number of tokens to keep after KV compression.",
         )
         parser.add_argument(
             "--hybrid-kvcache-ratio",

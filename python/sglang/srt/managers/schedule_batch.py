@@ -655,6 +655,9 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        # CPUKVEntry if this request's prefix was matched from the CPU prefix cache.
+        # None means either no CPU cache configured or no match found.
+        self.cpu_prefix_entry = None
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -1455,6 +1458,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
+
+        # ── CPU prefix cache matching ───────────────────────────────────────
+        # Mirror the radix cache mechanism: for any request whose prefix_indices
+        # are still empty (no GPU radix cache hit), check the CPU prefix cache.
+        # On a hit, allocate temporary GPU pool slots for the cached doc tokens
+        # and set req.prefix_indices so that prepare_for_extend treats them as
+        # a true prefix (model only processes query tokens as extend).
+        # The attention backend will load the actual KV from CPU layer-by-layer.
+        from sglang.srt.mem_cache.prefix_cpu_cache import get_global_cpu_prefix_cache
+        from sglang.srt.mem_cache.common import alloc_token_slots
+
+        _cpu_cache = get_global_cpu_prefix_cache()
+        if _cpu_cache is not None:
+            for req in reqs:
+                if len(req.prefix_indices) > 0:
+                    continue  # Already has prefix (radix cache or earlier match)
+                _hit = _cpu_cache.lookup_prefix(req.fill_ids)
+                if _hit is not None:
+                    _doc_len, _entry = _hit
+                    # Allocate temporary GPU pool slots for the doc portion.
+                    # The attention backend will write CPU-loaded KV into these
+                    # slots per layer before FlashAttention runs, enabling query
+                    # tokens to attend to the full doc context from the KV pool.
+                    _doc_slots = alloc_token_slots(self.tree_cache, _doc_len)
+                    # KEY CODE
+                    req.prefix_indices = _doc_slots
+                    req.cpu_prefix_entry = _entry
+                    req.set_extend_input_len(len(req.fill_ids) - _doc_len)
+
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
@@ -1498,6 +1530,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
+
+        # Pre-compute compressed extend lengths for the global/real split KV compression.
+        # Pre-compute compressed_extend_lens_cpu for the attention backend.
+        # IMPORTANT: out_cache_loc is still allocated for the full extend_len.
+        # The attention backend uses save_kv_cache=True so FlashAttention gets correct
+        # full-context KV.  After FlashAttention, the backend reads back from pool,
+        # compresses, writes the compressed subset in-place, updates req_to_token, and
+        # frees the excess slots.
+        _sa = get_global_server_args()
+        _ratio = _sa.kv_compression_ratio
+        if _ratio > 0.0:
+            _min_tok = _sa.kv_compression_min_tokens
+            _win = _sa.kv_compression_window_size
+            _comp_lens = []
+            for _pl, _el in zip(prefix_lens, extend_lens):
+                # _pl = doc_len for CPU-hit reqs, 0 for non-hit reqs
+                # _el = query_len for CPU-hit, all_tokens for non-hit
+                # Target compressed length based on the full context (prefix + extend).
+                _full_len = _pl + _el
+                if _full_len <= _min_tok or _full_len <= _win:
+                    _comp_lens.append(_full_len)
+                else:
+                    _comp_lens.append(max(_min_tok, int(_full_len * (1.0 - _ratio))))
+            self.compressed_extend_lens_cpu = _comp_lens
+            self.compressed_extend_num_tokens = sum(_comp_lens)
+        else:
+            self.compressed_extend_lens_cpu = None
+            self.compressed_extend_num_tokens = None
 
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
