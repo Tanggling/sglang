@@ -262,17 +262,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             forward_batch._gr_real_slots: Dict[int, torch.Tensor] = {}
             forward_batch._gr_compressed_lens: List[int] = []
             forward_batch._gr_cpu_prefix_slots: Dict[int, torch.Tensor] = {}
-
-            pre_alloc_compressed = getattr(forward_batch, "compressed_extend_lens_cpu", None) is not None
-            forward_batch._gr_pre_alloc_compressed = pre_alloc_compressed
-
-            if pre_alloc_compressed:
-                _cu = [0]
-                for _cl in forward_batch.compressed_extend_lens_cpu:
-                    _cu.append(_cu[-1] + _cl)
-                forward_batch._gr_cu_compressed: List[int] = _cu
-            else:
-                forward_batch._gr_slots_to_free: List[torch.Tensor] = []
+            forward_batch._gr_slots_to_free: List[torch.Tensor] = []
 
             # Identify CPU-hit and miss sequences
             forward_batch._cpu_miss_set: set = set()
@@ -293,7 +283,6 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                             # Hit: record the prefix pool slots for this seq
                             forward_batch._gr_cpu_prefix_slots[_si] = _req.prefix_indices
 
-        pre_alloc_compressed = forward_batch._gr_pre_alloc_compressed
         do_cpu = self.cpu_prefix_cache is not None
         cu_seqlens_q = metadata.cu_seqlens_q
         batch_size = cu_seqlens_q.shape[0] - 1
@@ -313,8 +302,9 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             for _si, _prefix_slots in cpu_prefix_slots.items():
                 _req = reqs[_si]
                 _entry = _req.cpu_prefix_entry
+                _match_len = _prefix_slots.shape[0]  # may be < entry.seq_len (partial match)
                 _k_doc, _v_doc = self.cpu_prefix_cache.load_layer_to_gpu(
-                    _entry, layer_id, str(device)
+                    _entry, layer_id, str(device), num_tokens=_match_len
                 )
                 self.k_buffer[layer_id][_prefix_slots] = _k_doc
                 self.v_buffer[layer_id][_prefix_slots] = _v_doc
@@ -436,17 +426,16 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 num_kv_heads=num_kv_heads,
             )
 
-        # ── Batch-free excess slots after layer 0 ─────────────────────────
-        # Excess = all_available[num_to_keep:] per sequence (includes both
-        # unused prefix slots and unused extend slots for CPU-hit requests).
-        if layer_id == 0 and hasattr(forward_batch, "_gr_slots_to_free"):
-            slots_to_free = forward_batch._gr_slots_to_free
+        # ── After last layer: free excess slots + finalize CPU save ──────
+        # Excess slots are freed here (not at layer 0) because layers 1+
+        # still use the same out_cache_loc / prefix_slots positions for
+        # set_kv_buffer writes and CPU KV loading.  Freeing earlier would
+        # let the allocator hand those slots to other requests mid-forward.
+        if layer_id == num_layers - 1:
+            slots_to_free = getattr(forward_batch, "_gr_slots_to_free", [])
             if slots_to_free:
                 self.token_to_kv_pool_allocator.free(torch.cat(slots_to_free))
-            del forward_batch._gr_slots_to_free
 
-        # ── After last layer: finalize CPU save ──────────────────────────
-        if layer_id == num_layers - 1:
             if do_cpu and cpu_miss_set:
                 _input_ids_list = forward_batch.input_ids.cpu().tolist()
                 for _si in cpu_miss_set:

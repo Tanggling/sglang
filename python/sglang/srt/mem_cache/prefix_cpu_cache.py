@@ -263,19 +263,27 @@ class PrefixCPUCache:
 
         return entry
 
-    def lookup_prefix(self, token_ids) -> Optional[Tuple[int, CPUKVEntry]]:
+    def lookup_prefix(
+        self, token_ids, min_match_len: int = 32
+    ) -> Optional[Tuple[int, CPUKVEntry]]:
         """
-        Find the longest cached entry whose token_ids is a prefix of ``token_ids``.
+        Find the cached entry that shares the longest common prefix with
+        ``token_ids``.
 
-        This is the primary lookup used for the CPU prefix cache feature:
-        given a request's full extend token IDs [doc | query], it finds whether
-        any previously cached sequence is a prefix (the document portion).
+        Unlike exact-prefix matching, this supports **partial reuse**: if a
+        cached entry has 1000 tokens but only the first 500 match the current
+        request, the 500-token common prefix is still returned so its KV can
+        be loaded from CPU (saving 500 tokens of GPU prefill).
 
         Args:
-            token_ids: Full extend token IDs for the current request.
+            token_ids:     Full token IDs for the current request.
+            min_match_len: Minimum number of matching tokens to consider a hit.
+                           Very short matches save little compute and are not
+                           worth the CPU→GPU transfer overhead.
 
         Returns:
-            (prefix_len, entry) for the longest matching prefix, or None.
+            (match_len, entry) for the best matching entry, or None.
+            ``match_len`` may be less than ``entry.seq_len`` (partial match).
         """
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.cpu().tolist()
@@ -285,17 +293,22 @@ class PrefixCPUCache:
         best_hash = None
 
         for h, entry in self._cache.items():
-            p_len = entry.seq_len
-            # Must be a strict prefix (leave at least one token for the new query)
-            if p_len >= len(token_ids):
+            # Compute common prefix length between token_ids and entry
+            common = 0
+            limit = min(len(token_ids) - 1, entry.seq_len)  # leave ≥1 extend token
+            for i in range(limit):
+                if token_ids[i] != entry.token_ids[i]:
+                    break
+                common = i + 1
+
+            if common < min_match_len:
                 continue
-            if p_len <= best_len:
+            if common <= best_len:
                 continue
-            # Check whether this entry is actually a prefix
-            if token_ids[:p_len] == entry.token_ids:
-                best_len = p_len
-                best_entry = entry
-                best_hash = h
+
+            best_len = common
+            best_entry = entry
+            best_hash = h
 
         if best_entry is None:
             return None
@@ -322,19 +335,25 @@ class PrefixCPUCache:
         entry: CPUKVEntry,
         layer_id: int,
         device: str,
+        num_tokens: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Transfer one layer's KV data from CPU to GPU.
 
         Args:
-            entry:    CPUKVEntry returned by lookup()
-            layer_id: Transformer layer index
-            device:   Target GPU device string (e.g., "cuda:0")
+            entry:      CPUKVEntry returned by lookup()
+            layer_id:   Transformer layer index
+            device:     Target GPU device string (e.g., "cuda:0")
+            num_tokens: If set, only transfer the first ``num_tokens`` tokens
+                        (for partial prefix matches where match_len < entry.seq_len).
 
         Returns:
             k_gpu, v_gpu tensors on the specified device
         """
         k_cpu, v_cpu = entry.kv_layers[layer_id]
+        if num_tokens is not None and num_tokens < k_cpu.shape[0]:
+            k_cpu = k_cpu[:num_tokens]
+            v_cpu = v_cpu[:num_tokens]
         k_gpu = k_cpu.to(device, non_blocking=False)
         v_gpu = v_cpu.to(device, non_blocking=False)
         return k_gpu, v_gpu
