@@ -4,6 +4,7 @@ python -m sglang.launch_server \
     --disable-cuda-graph \
     --mem-fraction-static 0.7 \
     --attention-backend compressed_fa3 \
+    --kv-compression-ratio 0.5 \
     --disable-radix-cache \
     --disable-context-len-check \
     --page-size 1 \

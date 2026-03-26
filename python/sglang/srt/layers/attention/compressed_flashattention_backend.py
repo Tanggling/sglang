@@ -152,6 +152,8 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             "layer_stats": {},
         }
 
+        self._verification_enabled = False  # Set to True to enable KV cache verification (debugging)
+
     # ================================================================== #
     # Main forward_extend entry point
     # ================================================================== #
@@ -1263,7 +1265,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         real_kv_pool (no global buffer needed for single tokens).
         """
         # Verify KV cache values before computation
-        self.verify_decode_kv_cache(layer, forward_batch)
+        # self.verify_decode_kv_cache(layer, forward_batch)
 
         # Call parent's forward_decode
         return super().forward_decode(
