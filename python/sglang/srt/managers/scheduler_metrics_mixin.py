@@ -239,6 +239,25 @@ class SchedulerMetricsMixin:
 
         msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}"
 
+        # Append KV compression metrics for this prefill
+        try:
+            from sglang.srt.layers.attention.compression_metrics import get_metrics as _get_comp_metrics
+            _cm = _get_comp_metrics()
+            if _cm.total_requests > 0:
+                _avg_ratio = _cm.total_compressed_tokens / _cm.total_original_tokens if _cm.total_original_tokens > 0 else 0.0
+                _total_lookups = _cm.cpu_cache_hits + _cm.cpu_cache_misses
+                _hit_rate = _cm.cpu_cache_hits / _total_lookups if _total_lookups > 0 else 0.0
+                msg += (
+                    f"\n  [KV Compress] reqs: {_cm.total_requests}, "
+                    f"avg ratio: {_avg_ratio:.1%} kept, "
+                    f"cpu cache hit: {_cm.cpu_cache_hits}/{_total_lookups} ({_hit_rate:.0%})"
+                )
+                if _cm.cpu_cache_hits > 0:
+                    _avg_match = _cm.cpu_total_match_tokens / _cm.cpu_cache_hits
+                    msg += f", avg match: {_avg_match:.0f} tokens"
+        except ImportError:
+            pass
+
         logger.info(msg)
 
         if self.enable_metrics:
@@ -411,6 +430,28 @@ class SchedulerMetricsMixin:
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}"
         )
+
+        # Append KV compression metrics if active
+        try:
+            from sglang.srt.layers.attention.compression_metrics import get_metrics as _get_comp_metrics
+            _cm = _get_comp_metrics()
+            if _cm.total_requests > 0:
+                _avg_ratio = _cm.total_compressed_tokens / _cm.total_original_tokens if _cm.total_original_tokens > 0 else 0.0
+                _total_lookups = _cm.cpu_cache_hits + _cm.cpu_cache_misses
+                _hit_rate = _cm.cpu_cache_hits / _total_lookups if _total_lookups > 0 else 0.0
+                msg += (
+                    f"\n  [KV Compress] reqs: {_cm.total_requests}, "
+                    f"avg ratio: {_avg_ratio:.1%} kept, "
+                    f"cpu cache hit: {_cm.cpu_cache_hits}/{_total_lookups} ({_hit_rate:.0%}), "
+                    f"avg prefill: {_cm.total_prefill_ms / _cm.total_requests:.1f}ms, "
+                    f"avg compress: {_cm.total_compress_ms / _cm.total_requests:.1f}ms"
+                )
+                if _cm.cpu_cache_hits > 0:
+                    msg += f", avg transfer: {_cm.total_cpu_transfer_ms / _cm.cpu_cache_hits:.1f}ms"
+                if _cm.decode_steps > 0:
+                    msg += f", avg decode: {_cm.total_decode_ms / _cm.decode_steps:.2f}ms"
+        except ImportError:
+            pass
 
         logger.info(msg)
         if self.enable_metrics:

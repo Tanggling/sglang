@@ -171,7 +171,6 @@ class SchedulerOutputProcessorMixin:
 
                 # Update kv_committed_len and kv_allocated_len if KV cache was compressed
                 if kv_compressed_lens is not None and kv_compressed_lens[i] is not None:
-                    print(f"Request {req.rid} had KV cache compressed to length {kv_compressed_lens[i]}")
                     req.kv_committed_len = kv_compressed_lens[i]
                     req.kv_allocated_len = kv_compressed_lens[i]
 

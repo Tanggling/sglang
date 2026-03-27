@@ -36,6 +36,10 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.compression_metrics import (
+    get_metrics,
+    CudaTimer,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.kv_compressor import CompressionConfig
@@ -266,8 +270,9 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             forward_batch._gr_cpu_prefix_slots: Dict[int, torch.Tensor] = {}
             forward_batch._gr_slots_to_free: List[torch.Tensor] = []
 
-            # Identify CPU-hit and miss sequences
+            # Identify CPU-hit and miss sequences; record metrics
             forward_batch._cpu_miss_set: set = set()
+            _metrics = get_metrics()
             do_cpu = self.cpu_prefix_cache is not None
             if do_cpu:
                 reqs = getattr(forward_batch, "reqs", None)
@@ -276,14 +281,18 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                     batch_size_now = metadata.cu_seqlens_q.shape[0] - 1
                     for _si in range(batch_size_now):
                         _req = reqs[_si]
+                        _req_id = req_pool_indices_now[_si].item()
                         if getattr(_req, "cpu_prefix_entry", None) is None:
                             # Miss: start accumulating per-layer KV
-                            _req_id = req_pool_indices_now[_si].item()
                             self.cpu_prefix_cache.start_accumulating(_req_id)
                             forward_batch._cpu_miss_set.add(_si)
+                            _metrics.log_cpu_cache_miss(_req_id)
                         else:
                             # Hit: record the prefix pool slots for this seq
                             forward_batch._gr_cpu_prefix_slots[_si] = _req.prefix_indices
+                            _entry = _req.cpu_prefix_entry
+                            _match_len = _req.prefix_indices.shape[0] if hasattr(_req.prefix_indices, 'shape') else len(_req.prefix_indices)
+                            _metrics.log_cpu_cache_hit(_req_id, match_len=_match_len, entry_len=_entry.seq_len)
 
         do_cpu = self.cpu_prefix_cache is not None
         cu_seqlens_q = metadata.cu_seqlens_q
@@ -299,17 +308,23 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         # and v_buffer at the pre-allocated prefix_indices positions.  This must
         # happen before super().forward_extend() so the FlashAttention kernel
         # can read the doc KV as a cached prefix (via req_to_token_pool / page_table).
+        _metrics = get_metrics()
         reqs = getattr(forward_batch, "reqs", None)
-        if reqs is not None:
-            for _si, _prefix_slots in cpu_prefix_slots.items():
-                _req = reqs[_si]
-                _entry = _req.cpu_prefix_entry
-                _match_len = _prefix_slots.shape[0]  # may be < entry.seq_len (partial match)
-                _k_doc, _v_doc = self.cpu_prefix_cache.load_layer_to_gpu(
-                    _entry, layer_id, str(device), num_tokens=_match_len
-                )
-                self.k_buffer[layer_id][_prefix_slots] = _k_doc
-                self.v_buffer[layer_id][_prefix_slots] = _v_doc
+        if reqs is not None and cpu_prefix_slots:
+            with CudaTimer() as _t_transfer:
+                for _si, _prefix_slots in cpu_prefix_slots.items():
+                    _req = reqs[_si]
+                    _entry = _req.cpu_prefix_entry
+                    _match_len = _prefix_slots.shape[0]  # may be < entry.seq_len (partial match)
+                    _k_doc, _v_doc = self.cpu_prefix_cache.load_layer_to_gpu(
+                        _entry, layer_id, str(device), num_tokens=_match_len
+                    )
+                    self.k_buffer[layer_id][_prefix_slots] = _k_doc
+                    self.v_buffer[layer_id][_prefix_slots] = _v_doc
+            # Record transfer time (accumulated across layers for each hit req)
+            for _si in cpu_prefix_slots:
+                _req_id = req_pool_indices[_si].item()
+                _metrics.log_cpu_transfer_time(_req_id, _t_transfer.elapsed_ms)
 
         # ── FlashAttention forward pass WITH KV cache write ───────────────
         # save_kv_cache=True is required: SGLang's flash_attn_with_kvcache reads
@@ -326,9 +341,15 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         #
         # After this call, the backend reads the full KV back from the pool,
         # compresses it, overwrites in-place, updates req_to_token, frees excess.
-        output = super().forward_extend(
-            q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
-        )
+        with CudaTimer() as _t_prefill:
+            output = super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
+            )
+        # Record prefill time per request (only once at layer 0)
+        if layer_id == 0:
+            for _si in range(metadata.cu_seqlens_q.shape[0] - 1):
+                _req_id = req_pool_indices[_si].item()
+                _metrics.log_prefill_time(_req_id, _t_prefill.elapsed_ms)
 
         all_compressed_lens: List[int] = getattr(forward_batch, "_gr_compressed_lens", [])
 
@@ -412,6 +433,9 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
                 forward_batch._gr_real_slots[seq_idx] = real_slots
                 all_compressed_lens.append(num_to_keep)
+
+                # Record compression metrics
+                _metrics.log_compression(req_id, original_len=full_seq_len, compressed_len=num_to_keep)
             else:
                 real_slots = forward_batch._gr_real_slots[seq_idx]
                 num_to_keep = real_slots.shape[0]
@@ -449,6 +473,12 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
         forward_batch._gr_compressed_lens = all_compressed_lens
         forward_batch.kv_compressed_lens = all_compressed_lens
+
+        # NOTE: seq_lens is NOT updated here.  The scheduler updates
+        # batch.seq_lens from batch_result.kv_compressed_lens after the
+        # forward pass returns (scheduler.py L2401-2407).  That assignment
+        # happens before prepare_for_decode / alloc_for_decode, so the
+        # decode phase correctly sees the compressed length.
 
         return output
 
@@ -1264,13 +1294,15 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         In global_real_split mode, decode writes new token KV directly to
         real_kv_pool (no global buffer needed for single tokens).
         """
-        # Verify KV cache values before computation
-        # self.verify_decode_kv_cache(layer, forward_batch)
-
-        # Call parent's forward_decode
-        return super().forward_decode(
-            q, k, v, layer, forward_batch, save_kv_cache, **kwargs
-        )
+        layer_id = layer.layer_id
+        with CudaTimer() as _t_decode:
+            result = super().forward_decode(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
+        # Only record at layer 0 to avoid over-counting
+        if layer_id == 0:
+            get_metrics().log_decode_time(_t_decode.elapsed_ms)
+        return result
 
     # ================================================================== #
     # Scheduler Integration Helper
