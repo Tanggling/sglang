@@ -1216,7 +1216,7 @@ class FlashAttentionBackend(AttentionBackend):
                             )
                         )
                 # print(f"Using page table with shape {page_table.shape} and values: {page_table}")
-                print(f"Using cache_seqlens: {metadata.cache_seqlens_int32}")
+                # print(f"Using cache_seqlens: {metadata.cache_seqlens_int32}")
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q

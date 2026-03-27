@@ -31,6 +31,7 @@ CPU Prefix Cache Mode (Feature 2):
 """
 
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Literal
+import logging
 
 import torch
 import torch.nn.functional as F
@@ -40,6 +41,8 @@ from sglang.srt.layers.attention.compression_metrics import (
     get_metrics,
     CudaTimer,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.kv_compressor import CompressionConfig
@@ -474,6 +477,31 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         forward_batch._gr_compressed_lens = all_compressed_lens
         forward_batch.kv_compressed_lens = all_compressed_lens
 
+        # Log compression metrics directly from model worker process
+        if layer_id == num_layers - 1:
+            _cm = get_metrics()
+            if _cm.total_requests > 0 and _cm.total_requests % _cm._log_interval == 0:
+                _avg_ratio = (
+                    _cm.total_compressed_tokens / _cm.total_original_tokens
+                    if _cm.total_original_tokens > 0 else 0.0
+                )
+                _total_lookups = _cm.cpu_cache_hits + _cm.cpu_cache_misses
+                _hit_rate = _cm.cpu_cache_hits / _total_lookups if _total_lookups > 0 else 0.0
+                _msg = (
+                    f"[KV Compress] reqs: {_cm.total_requests}, "
+                    f"avg ratio: {_avg_ratio:.1%} kept, "
+                    f"cpu cache hit: {_cm.cpu_cache_hits}/{_total_lookups} ({_hit_rate:.0%})"
+                )
+                if _cm.cpu_cache_hits > 0:
+                    _msg += f", avg match: {_cm.cpu_total_match_tokens / _cm.cpu_cache_hits:.0f} tokens"
+                    _msg += f", avg transfer: {_cm.total_cpu_transfer_ms / _cm.cpu_cache_hits:.1f}ms"
+                if _cm.total_requests > 0:
+                    _msg += f", avg prefill: {_cm.total_prefill_ms / _cm.total_requests:.1f}ms"
+                    _msg += f", avg compress: {_cm.total_compress_ms / _cm.total_requests:.1f}ms"
+                if _cm.decode_steps > 0:
+                    _msg += f", avg decode: {_cm.total_decode_ms / _cm.decode_steps:.2f}ms"
+                logger.info(_msg)
+
         # NOTE: seq_lens is NOT updated here.  The scheduler updates
         # batch.seq_lens from batch_result.kv_compressed_lens after the
         # forward pass returns (scheduler.py L2401-2407).  That assignment
@@ -785,7 +813,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         # Print compression info (same format as SnapKV)
         total_original = cu_seqlens_q[-1].item()
         total_kept = sum(n for n in all_num_to_keep if n > 0)
-        print(f"[SnapKV] Compression: {total_original} -> {total_kept} tokens (freed {total_original - total_kept})")
+        # print(f"[SnapKV] Compression: {total_original} -> {total_kept} tokens (freed {total_original - total_kept})")
 
         # Print all KV heads' keep indices for first sequence (sorted from small to large)
         if batch_size > 0 and all_keep_local_indices[0] is not None and all_keep_local_indices[0].dim() == 2:
@@ -793,7 +821,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             num_kv_heads = first_seq_indices.shape[0]
             for i in range(num_kv_heads):
                 head_indices = sorted(first_seq_indices[i].tolist())
-                print(f"[SnapKV] {i} KV head keep indices ({len(head_indices)} tokens): {head_indices}")
+                # print(f"[SnapKV] {i} KV head keep indices ({len(head_indices)} tokens): {head_indices}")
 
         # Choose compression scheme
         if self.compression_scheme == "single_layer_zero_out":
@@ -1007,15 +1035,15 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
         # Print summary for this layer/seq
         status = "PASSED" if all_passed else "FAILED"
-        print(f"[PREFILL] Layer {layer_id}, Seq {seq_idx}: {status} (num_to_keep={num_to_keep}, heads={num_kv_heads})")
+        # print(f"[PREFILL] Layer {layer_id}, Seq {seq_idx}: {status} (num_to_keep={num_to_keep}, heads={num_kv_heads})")
 
         # Print per-head token selection for debugging
         if seq_idx == 0:  # Only print for first sequence to avoid too much output
-            print(f"[PER-HEAD COMPRESSION] Layer {layer_id}:")
+            # print(f"[PER-HEAD COMPRESSION] Layer {layer_id}:")
             for head_idx in range(min(2, num_kv_heads)):  # Only print first 2 heads
                 head_keep_indices = keep_local_indices[head_idx]
                 sorted_indices = sorted(head_keep_indices.tolist())
-                print(f"  Head {head_idx} keeps tokens: {sorted_indices[:min(10, len(sorted_indices))]}")
+                # print(f"  Head {head_idx} keeps tokens: {sorted_indices[:min(10, len(sorted_indices))]}")
 
     def _move_kv_cache_data(
         self,
