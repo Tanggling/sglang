@@ -99,9 +99,8 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         fa_impl_ver: int = 3,
         importance_method: ImportanceMethod = "snapkv",
         compression_scheme: CompressionScheme = "standard",
-        # Feature 2: CPU prefix cache
+        # Feature 2: CPU prefix cache (if None, auto-created)
         cpu_prefix_cache: Optional["PrefixCPUCache"] = None,
-        save_prefix_to_cpu: bool = False,
     ):
         super().__init__(runner, fa_impl_ver=fa_impl_ver)
 
@@ -131,10 +130,24 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         )
 
         # ------------------------------------------------------------------ #
-        # Feature 2: CPU Prefix Cache
+        # Feature 2: CPU Prefix Cache (default: enabled)
         # ------------------------------------------------------------------ #
-        self.cpu_prefix_cache: Optional["PrefixCPUCache"] = cpu_prefix_cache
-        self.save_prefix_to_cpu: bool = save_prefix_to_cpu
+        if cpu_prefix_cache is not None:
+            self.cpu_prefix_cache = cpu_prefix_cache
+        else:
+            from sglang.srt.mem_cache.prefix_cpu_cache import (
+                PrefixCPUCache,
+                get_global_cpu_prefix_cache,
+                set_global_cpu_prefix_cache,
+            )
+            existing = get_global_cpu_prefix_cache()
+            if existing is not None:
+                self.cpu_prefix_cache = existing
+            else:
+                self.cpu_prefix_cache = PrefixCPUCache(max_entries=64)
+                set_global_cpu_prefix_cache(self.cpu_prefix_cache)
+                logger.info("[KV Compress] Created global PrefixCPUCache (max_entries=64)")
+        self.save_prefix_to_cpu: bool = True
 
         self._compression_stats = {
             "total_compressed": 0,
