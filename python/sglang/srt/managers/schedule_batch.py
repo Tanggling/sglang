@@ -658,6 +658,8 @@ class Req(ReqDllmMixin):
         # CPUKVEntry if this request's prefix was matched from the CPU prefix cache.
         # None means either no CPU cache configured or no match found.
         self.cpu_prefix_entry = None
+        # Number of tokens matched from CPU prefix cache (0 = miss).
+        self.cpu_match_len = 0
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -1460,12 +1462,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs = self.reqs
 
         # ── CPU prefix cache matching ───────────────────────────────────────
-        # Mirror the radix cache mechanism: for any request whose prefix_indices
-        # are still empty (no GPU radix cache hit), check the CPU prefix cache.
-        # On a hit, allocate temporary GPU pool slots for the cached doc tokens
-        # and set req.prefix_indices so that prepare_for_extend treats them as
-        # a true prefix (model only processes query tokens as extend).
-        # The attention backend will load the actual KV from CPU layer-by-layer.
+        # For CPU-hit requests, allocate temporary GPU slots for the matched
+        # prefix and set prefix_indices so the model only processes unmatched
+        # extend tokens.  The backend loads CPU-stored KV into prefix slots
+        # before FlashAttention.  If query is too short for compression,
+        # the backend loads stored Q from CPU to pad to window_size.
         from sglang.srt.mem_cache.prefix_cpu_cache import get_global_cpu_prefix_cache
         from sglang.srt.mem_cache.common import alloc_token_slots
 
@@ -1476,16 +1477,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     continue  # Already has prefix (radix cache or earlier match)
                 _hit = _cpu_cache.lookup_prefix(req.fill_ids)
                 if _hit is not None:
-                    _doc_len, _entry = _hit
-                    # Allocate temporary GPU pool slots for the doc portion.
-                    # The attention backend will write CPU-loaded KV into these
-                    # slots per layer before FlashAttention runs, enabling query
-                    # tokens to attend to the full doc context from the KV pool.
-                    _doc_slots = alloc_token_slots(self.tree_cache, _doc_len)
-                    # KEY CODE
+                    _match_len, _entry = _hit
+                    _doc_slots = alloc_token_slots(self.tree_cache, _match_len)
                     req.prefix_indices = _doc_slots
                     req.cpu_prefix_entry = _entry
-                    req.set_extend_input_len(len(req.fill_ids) - _doc_len)
+                    req.cpu_match_len = _match_len
+                    req.set_extend_input_len(len(req.fill_ids) - _match_len)
 
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)

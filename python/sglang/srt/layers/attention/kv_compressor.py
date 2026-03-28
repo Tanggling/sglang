@@ -334,7 +334,11 @@ class SnapKVStyleCompressor(BaseKVCompressor):
         )
         
         window_size = min(self.config.window_size, seq_len)
-        
+
+        # Ensure window fits within num_tokens_to_keep
+        if window_size > num_tokens_to_keep:
+            window_size = num_tokens_to_keep
+
         if attention_scores is None and query is not None:
             num_heads = query.shape[1]
             q_head_dim = query.shape[2]
@@ -361,10 +365,12 @@ class SnapKVStyleCompressor(BaseKVCompressor):
                         k_window_t = k_window_t.repeat_interleave(kv_group_num, dim=0)
                     
                     attn_weights_window = torch.matmul(q_t, k_window_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
-                    
+
+                    q_window_len = q_window.shape[0]
+                    k_window_len = k_window.shape[0]
                     causal_mask = torch.triu(
-                        torch.full((window_size, window_size), float('-inf'), device=k.device, dtype=attn_weights_window.dtype),
-                        diagonal=1
+                        torch.full((q_window_len, k_window_len), float('-inf'), device=k.device, dtype=attn_weights_window.dtype),
+                        diagonal=1 + k_window_len - q_window_len
                     )
                     attn_weights_window = attn_weights_window + causal_mask.unsqueeze(0)
                     

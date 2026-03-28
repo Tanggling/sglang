@@ -59,20 +59,25 @@ def get_global_cpu_prefix_cache() -> Optional["PrefixCPUCache"]:
 @dataclass
 class CPUKVEntry:
     """
-    CPU-side storage for full (uncompressed) KV data of a prefix.
+    CPU-side storage for full (uncompressed) KV **and Q** data of a prefix.
 
     Fields:
-        token_ids: The prefix token IDs used as cache key (for collision detection)
-        seq_len:   Number of prefix tokens
-        kv_layers: List of (k_cpu, v_cpu) per layer.
-                   Each tensor shape: [seq_len, num_kv_heads, head_dim] on CPU
-        ref_count: Number of active requests currently using this entry
+        token_ids:  The prefix token IDs used as cache key (for collision detection)
+        seq_len:    Number of prefix tokens
+        kv_layers:  List of (k_cpu, v_cpu) per layer.
+                    Each tensor shape: [seq_len, num_kv_heads, head_dim] on CPU
+        q_layers:   List of q_cpu per layer.
+                    Each tensor shape: [seq_len, num_heads, head_dim] on CPU.
+                    Used to pad short queries during compression importance estimation.
+        ref_count:  Number of active requests currently using this entry
     """
 
     token_ids: List[int]
     seq_len: int
     # kv_layers[layer_id] = (k_cpu_tensor, v_cpu_tensor)
     kv_layers: List[Tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
+    # q_layers[layer_id] = q_cpu_tensor
+    q_layers: List[torch.Tensor] = field(default_factory=list)
     ref_count: int = 0
 
     def mem_usage_bytes(self) -> int:
@@ -81,6 +86,8 @@ class CPUKVEntry:
         for k_cpu, v_cpu in self.kv_layers:
             total += k_cpu.numel() * k_cpu.element_size()
             total += v_cpu.numel() * v_cpu.element_size()
+        for q_cpu in self.q_layers:
+            total += q_cpu.numel() * q_cpu.element_size()
         return total
 
 
@@ -92,7 +99,7 @@ class PrefixCPUCache:
         cache = PrefixCPUCache(max_entries=64)
 
         # During first request's prefill (call once per layer):
-        cache.accumulate_layer_kv(request_id, layer_id, k_gpu, v_gpu)
+        cache.accumulate_layer_kqv(request_id, layer_id, k_gpu, v_gpu, q_gpu)
 
         # After all layers of first request's prefill complete:
         cache.finalize_entry(request_id, token_ids)
@@ -135,24 +142,26 @@ class PrefixCPUCache:
         """Begin accumulating KV data for a new prefix entry."""
         self._pending[request_id] = {}
 
-    def accumulate_layer_kv(
+    def accumulate_layer_kqv(
         self,
         request_id: int,
         layer_id: int,
         k: torch.Tensor,
         v: torch.Tensor,
+        q: torch.Tensor,
     ) -> None:
         """
-        Save one layer's full KV tensors to CPU during first prefill.
+        Save one layer's full K, V, and Q tensors to CPU during first prefill.
 
-        This should be called for every layer during the first request's prefill.
-        Tensors are moved to CPU asynchronously when possible.
+        Q is stored so that future CPU-hit requests with short queries can pad
+        their Q with the stored Q to reach the compressor's window_size.
 
         Args:
             request_id: Unique identifier for the in-flight request.
             layer_id:   Transformer layer index.
-            k:          Key tensor [seq_len, num_kv_heads, head_dim] (GPU)
+            k:          Key tensor   [seq_len, num_kv_heads, head_dim] (GPU)
             v:          Value tensor [seq_len, num_kv_heads, v_head_dim] (GPU)
+            q:          Query tensor [seq_len, num_heads, head_dim] (GPU)
         """
         if request_id not in self._pending:
             logger.warning(
@@ -164,7 +173,8 @@ class PrefixCPUCache:
         # Non-blocking transfer to CPU (overlaps with GPU compute)
         k_cpu = k.detach().to("cpu", non_blocking=True)
         v_cpu = v.detach().to("cpu", non_blocking=True)
-        self._pending[request_id][layer_id] = (k_cpu, v_cpu)
+        q_cpu = q.detach().to("cpu", non_blocking=True)
+        self._pending[request_id][layer_id] = (k_cpu, v_cpu, q_cpu)
 
     def finalize_entry(self, request_id: int, token_ids) -> Optional[int]:
         """
@@ -174,7 +184,7 @@ class PrefixCPUCache:
         accumulated.
 
         Args:
-            request_id: The request ID used in accumulate_layer_kv().
+            request_id: The request ID used in accumulate_layer_kqv().
             token_ids:  Prefix token IDs (list or Tensor) used as cache key.
 
         Returns:
@@ -197,19 +207,23 @@ class PrefixCPUCache:
 
         h = self._hash_tokens(token_ids)
 
-        # Build kv_layers list in sorted order
+        # Build kv_layers and q_layers lists in sorted order
         num_layers = max(pending_layers.keys()) + 1
         kv_layers = []
+        q_layers = []
         for layer_id in range(num_layers):
             if layer_id not in pending_layers:
                 logger.error(f"PrefixCPUCache: missing layer {layer_id} for request {request_id}")
                 return None
-            kv_layers.append(pending_layers[layer_id])
+            k_cpu, v_cpu, q_cpu = pending_layers[layer_id]
+            kv_layers.append((k_cpu, v_cpu))
+            q_layers.append(q_cpu)
 
         entry = CPUKVEntry(
             token_ids=token_ids,
             seq_len=len(token_ids),
             kv_layers=kv_layers,
+            q_layers=q_layers,
         )
         entry_bytes = entry.mem_usage_bytes()
 
@@ -293,9 +307,13 @@ class PrefixCPUCache:
         best_hash = None
 
         for h, entry in self._cache.items():
-            # Compute common prefix length between token_ids and entry
+            # Compute common prefix length between token_ids and entry.
+            # Leave at least 1 token as extend so the model can produce logits.
             common = 0
-            limit = min(len(token_ids) - 1, entry.seq_len)  # leave ≥1 extend token
+            '''
+                KEY CODE
+            '''
+            limit = min(len(token_ids) - 1, entry.seq_len)
             for i in range(limit):
                 if token_ids[i] != entry.token_ids[i]:
                     break
@@ -357,6 +375,33 @@ class PrefixCPUCache:
         k_gpu = k_cpu.to(device, non_blocking=False)
         v_gpu = v_cpu.to(device, non_blocking=False)
         return k_gpu, v_gpu
+
+    def load_query_to_gpu(
+        self,
+        entry: CPUKVEntry,
+        layer_id: int,
+        device: str,
+        start: int = 0,
+        end: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Load stored Q from CPU to GPU for a given layer.
+
+        Args:
+            entry:    CPUKVEntry returned by lookup()
+            layer_id: Transformer layer index
+            device:   Target GPU device string
+            start:    Start token index (inclusive)
+            end:      End token index (exclusive), None = entry.seq_len
+
+        Returns:
+            q_gpu tensor [end-start, num_heads, head_dim] on device
+        """
+        q_cpu = entry.q_layers[layer_id]
+        if end is None:
+            end = q_cpu.shape[0]
+        q_slice = q_cpu[start:end]
+        return q_slice.to(device, non_blocking=False)
 
     # ------------------------------------------------------------------ #
     # Eviction                                                             #
