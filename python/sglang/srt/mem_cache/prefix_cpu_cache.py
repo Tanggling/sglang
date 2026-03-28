@@ -10,8 +10,8 @@ Design Philosophy:
        FULL (pre-compression) KV for each layer to CPU RAM.
 
     2. Second+ requests with the same prefix: instead of running prefill,
-       load full KV from CPU layer-by-layer into GlobalKVPool, apply compression,
-       and write compressed result to the real KV pool. This reuses the expensive
+       load full KV from CPU layer-by-layer into GPU KV pool, apply compression,
+       and write compressed result to the KV pool. This reuses the expensive
        prefill computation.
 
     Trade-offs:

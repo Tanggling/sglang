@@ -19,10 +19,8 @@ Importance Estimation Methods:
 - "snapkv": Compute full attention scores (slow, accurate)
 
 Global/Real Split Mode (Feature 1):
-    When `use_global_real_split=True`, the backend maintains two separate pools:
-    - global_kv_pool: Single-layer temporary buffer for full KV (reused per layer)
-    - real_kv_pool:   Per-layer persistent buffer for compressed KV
-    Allocation at scheduling time uses compressed length, not full length.
+    When `use_global_real_split=True`, the backend compresses KV cache per layer
+    and releases excess slots after all layers are processed.
 
 CPU Prefix Cache Mode (Feature 2):
     When `cpu_prefix_cache` is provided, the backend:
@@ -48,7 +46,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.kv_compressor import CompressionConfig
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.mem_cache.global_kv_pool import GlobalKVPool
     from sglang.srt.mem_cache.prefix_cpu_cache import PrefixCPUCache
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
@@ -102,9 +99,6 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         fa_impl_ver: int = 3,
         importance_method: ImportanceMethod = "snapkv",
         compression_scheme: CompressionScheme = "standard",
-        # Feature 1: Global/Real split
-        global_kv_pool: Optional["GlobalKVPool"] = None,
-        real_kv_pool_allocator: Optional["BaseTokenToKVPoolAllocator"] = None,
         # Feature 2: CPU prefix cache
         cpu_prefix_cache: Optional["PrefixCPUCache"] = None,
         save_prefix_to_cpu: bool = False,
@@ -132,19 +126,8 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         self.k_buffer = runner.token_to_kv_pool.k_buffer
         self.v_buffer = runner.token_to_kv_pool.v_buffer
 
-        # ------------------------------------------------------------------ #
-        # Feature 1: Global/Real KV Pool Split
-        # ------------------------------------------------------------------ #
-        self.global_kv_pool: Optional["GlobalKVPool"] = global_kv_pool
-        # real_kv_pool_allocator manages the compressed KV slots.
-        # Falls back to token_to_kv_pool_allocator if not provided (legacy mode).
-        self.real_kv_pool_allocator = (
-            real_kv_pool_allocator
-            if real_kv_pool_allocator is not None
-            else runner.token_to_kv_pool_allocator
-        )
         self.use_global_real_split = (
-            compression_scheme == "global_real_split" and global_kv_pool is not None
+            compression_scheme == "global_real_split"
         )
 
         # ------------------------------------------------------------------ #
@@ -475,7 +458,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                     self.cpu_prefix_cache.finalize_entry(_req_id, _toks)
 
         forward_batch._gr_compressed_lens = all_compressed_lens
-        forward_batch.kv_compressed_lens = all_compressed_lens
+        forward_batch.kv_compressed_lens = [num_to_keep + 1 for num_to_keep in all_compressed_lens]
 
         # Log compression metrics directly from model worker process
         if layer_id == num_layers - 1:
@@ -650,7 +633,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
             # Step 3 (layer 0 only): Allocate real_kv_pool slots
             if layer_id == 0:
-                real_slots = self.real_kv_pool_allocator.alloc(num_to_keep)
+                real_slots = self.token_to_kv_pool_allocator.alloc(num_to_keep)
                 if real_slots is None:
                     raise RuntimeError(
                         f"[CPUPrefixCache] RealKVPool OOM: need {num_to_keep} slots"
@@ -1366,19 +1349,12 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         """
         Check if there's enough memory to accept a request of seq_len tokens.
 
-        Uses compressed length for the real KV pool check.
-        Also checks GlobalKVPool has space for full sequence (if using global_real_split).
+        Uses compressed length for the KV pool check.
         """
         compressed_len = self.estimate_memory_needed(seq_len)
 
-        # Check real KV pool
-        if self.real_kv_pool_allocator.available_size() < compressed_len:
+        if self.token_to_kv_pool_allocator.available_size() < compressed_len:
             return False
-
-        # Check global KV pool (must fit one layer's full sequence)
-        if self.use_global_real_split and self.global_kv_pool is not None:
-            if self.global_kv_pool.available_size() < seq_len:
-                return False
 
         return True
 

@@ -370,6 +370,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For KV cache compression
     kv_compressed_lens: Optional[List[int]] = None
+    # Req objects (used by compressed attention backend to access cpu_prefix_entry)
+    reqs: Optional[List] = None
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
@@ -424,6 +426,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            reqs=batch.reqs,
         )
         device = model_runner.device
 
