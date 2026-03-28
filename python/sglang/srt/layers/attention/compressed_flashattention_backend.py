@@ -173,6 +173,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         In both cases the FULL attention output is returned (no quality loss from compression).
         """
         if save_kv_cache:
+            # print(f"q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}")
             return self._forward_extend_global_real_split(
                 q, k, v, layer, forward_batch, **kwargs
             )
@@ -459,7 +460,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         # Log compression metrics directly from model worker process
         if layer_id == num_layers - 1:
             _cm = get_metrics()
-            if _cm.total_requests > 0 and _cm.total_requests % _cm._log_interval == 0:
+            if _cm.total_requests > 0:
                 _avg_ratio = (
                     _cm.total_compressed_tokens / _cm.total_original_tokens
                     if _cm.total_original_tokens > 0 else 0.0
