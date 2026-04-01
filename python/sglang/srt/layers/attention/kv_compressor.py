@@ -332,6 +332,8 @@ class SnapKVStyleCompressor(BaseKVCompressor):
             self.config.min_tokens_to_keep,
             int(seq_len * (1 - self.config.compression_ratio))
         )
+
+        num_tokens_to_keep = min(num_tokens_to_keep, seq_len)
         
         window_size = min(self.config.window_size, seq_len)
 
@@ -350,17 +352,18 @@ class SnapKVStyleCompressor(BaseKVCompressor):
             if k_prefix.shape[0] == 0:
                 keep_indices = torch.arange(seq_len, device=k.device).unsqueeze(0).expand(num_kv_heads, -1)
             else:
-                q_t = q_window.transpose(0, 1)
-                k_t = k_prefix.transpose(0, 1)
+                q_t = q_window.transpose(0, 1).contiguous()
+                k_t = k_prefix.transpose(0, 1).contiguous()
                 
                 if kv_group_num > 1:
                     k_t = k_t.repeat_interleave(kv_group_num, dim=0)
-                
+                    
                 attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
-                
+                torch.cuda.current_stream().synchronize()
+
                 if self.apply_causal_mask:
                     k_window = k[-window_size:]
-                    k_window_t = k_window.transpose(0, 1)
+                    k_window_t = k_window.transpose(0, 1).contiguous()
                     if kv_group_num > 1:
                         k_window_t = k_window_t.repeat_interleave(kv_group_num, dim=0)
                     
@@ -421,10 +424,12 @@ class SnapKVStyleCompressor(BaseKVCompressor):
         else:
             keep_indices = torch.arange(seq_len, device=k.device).unsqueeze(0).expand(num_kv_heads, -1)
         
-        compressed_k = k[keep_indices]
-        compressed_v = v[keep_indices]
+        # keep_indices = torch.arange(num_tokens_to_keep, device=k.device).unsqueeze(0).expand(num_kv_heads, -1)
+
+        # compressed_k = k[keep_indices]
+        # compressed_v = v[keep_indices]
         
-        return compressed_k, compressed_v, keep_indices
+        return None, None, keep_indices
 
 
 def create_compressor(config: CompressionConfig) -> BaseKVCompressor:

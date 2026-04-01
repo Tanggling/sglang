@@ -237,6 +237,8 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
         metadata = self.forward_metadata
 
+        do_cpu = self.cpu_prefix_cache is not None
+
         # ── Layer-0 initialisation ─────────────────────────────────────────
         if layer_id == 0:
             forward_batch._gr_real_slots: Dict[int, torch.Tensor] = {}
@@ -246,7 +248,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
             forward_batch._cpu_miss_set: set = set()
             _metrics = get_metrics()
-            do_cpu = self.cpu_prefix_cache is not None
+            # do_cpu = False # self.cpu_prefix_cache is not None
             if do_cpu:
                 reqs = getattr(forward_batch, "reqs", None)
                 if reqs is not None:
@@ -268,7 +270,6 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                             forward_batch._cpu_miss_set.add(_si)
                             _metrics.log_cpu_cache_miss(_req_id)
 
-        do_cpu = self.cpu_prefix_cache is not None
         cu_seqlens_q = metadata.cu_seqlens_q
         batch_size = cu_seqlens_q.shape[0] - 1
         req_pool_indices = forward_batch.req_pool_indices
@@ -455,7 +456,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                     self.cpu_prefix_cache.finalize_entry(_req_id, _toks)
 
         forward_batch._gr_compressed_lens = all_compressed_lens
-        forward_batch.kv_compressed_lens = all_compressed_lens
+        forward_batch.kv_compressed_lens = [num_to_keep + 1 for num_to_keep in all_compressed_lens]
 
         # Log compression metrics directly from model worker process
         if layer_id == num_layers - 1:

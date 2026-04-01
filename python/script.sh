@@ -1,12 +1,12 @@
 python -m sglang.launch_server \
-    --model-path ../../../autodl-tmp/Qwen2.5-7B-Instruct/ \
+    --model-path ../../../autodl-tmp/LWM-1M/ \
     --port 30000 \
     --disable-cuda-graph \
-    --mem-fraction-static 0.7 \
+    --mem-fraction-static 0.8 \
     --disable-radix-cache \
     --disable-context-len-check \
     --page-size 1 \
     --chunked-prefill-size -1 \
-    --max-prefill-tokens 32768 \
+    --max-prefill-tokens 120000 \
     --attention-backend compressed_fa3 \
-    --kv-compression-ratio 0.5 
+    --kv-compression-ratio 0.9
