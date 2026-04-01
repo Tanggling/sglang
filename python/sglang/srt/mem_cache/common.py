@@ -123,6 +123,38 @@ def write_cache_indices(
             pt += extend_len
 
 
+def write_cache_indices_compressed(
+    out_cache_loc: torch.Tensor,
+    req_pool_indices_cpu: torch.Tensor,
+    compressed_total_lens_cpu: torch.Tensor,
+    req_to_token_pool: ReqToTokenPool,
+):
+    """
+    Write compressed cache indices to req_to_token_pool.
+    
+    This is used for the global/real split KV compression design where:
+    - Only compressed total length slots are allocated
+    - Both prefix and extend parts are compressed together
+    - The compressed slots are written to [0:compressed_total_len]
+    
+    Args:
+        out_cache_loc: Allocated cache locations for all requests
+        req_pool_indices_cpu: Request pool indices
+        compressed_total_lens_cpu: Compressed total length for each request
+        req_to_token_pool: Request to token pool
+    """
+    pt = 0
+    for i in range(req_pool_indices_cpu.shape[0]):
+        req_idx = req_pool_indices_cpu[i].item()
+        compressed_len = compressed_total_lens_cpu[i].item()
+        
+        req_to_token_pool.write(
+            (req_idx, slice(0, compressed_len)),
+            out_cache_loc[pt : pt + compressed_len],
+        )
+        pt += compressed_len
+
+
 def get_last_loc(
     req_to_token: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -326,9 +358,15 @@ def alloc_req_slots(
 
 def alloc_for_extend(
     batch: ScheduleBatch,
+    use_compressed_len: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
+
+    Args:
+        batch: ScheduleBatch object
+        use_compressed_len: If True, allocate compressed total length (prefix + extend compressed together).
+                           This is used for the global/real split KV compression design.
 
     Returns:
         out_cache_loc: allocated cache locations
@@ -353,13 +391,53 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
-    # Always allocate the full extend_len slots.
-    # The compression attention backend uses save_kv_cache=True so that FlashAttention
-    # can read complete KV for all extend tokens (including query tokens for CPU-hit reqs).
-    # After FlashAttention, the backend compresses the KV in-place, updates req_to_token,
-    # and frees the excess pool slots.
-    if True:
+    # Determine whether to use compressed length or full extend length
+    if use_compressed_len and batch.compressed_total_num_tokens is not None:
+        # New path: allocate compressed total length for global/real split design
+        # This allocates slots for BOTH compressed prefix and compressed extend parts
+        # The total length = compression_ratio * (prefix_len + extend_len)
+        compressed_total_lens_cpu = torch.tensor(
+            batch.compressed_total_lens_cpu, dtype=torch.int64
+        )
+
+        if batch.tree_cache.page_size == 1:
+            out_cache_loc = alloc_token_slots(
+                batch.tree_cache, batch.compressed_total_num_tokens
+            )
+        else:
+            # Paged allocation
+            # For compressed allocation, seq_lens = compressed_total_lens
+            compressed_seq_lens_device = compressed_total_lens_cpu.to(
+                batch.device, non_blocking=True
+            )
+            # Build last_loc (all -1 since we're starting fresh for compressed allocation)
+            last_loc = torch.full(
+                (len(batch.reqs),), -1, dtype=torch.int64, device=batch.device
+            )
+            out_cache_loc = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache,
+                prefix_lens=torch.zeros_like(prefix_lens_device),  # No prefix for compressed allocation
+                prefix_lens_cpu=torch.zeros_like(prefix_lens_cpu),
+                seq_lens=compressed_seq_lens_device,
+                seq_lens_cpu=compressed_total_lens_cpu,
+                last_loc=last_loc,
+                extend_num_tokens=batch.compressed_total_num_tokens,
+            )
+
+        # Write compressed cache indices
+        # Both prefix and extend are compressed together, written to [0:compressed_total_len]
+        write_cache_indices_compressed(
+            out_cache_loc,
+            req_pool_indices_cpu,
+            compressed_total_lens_cpu,
+            batch.req_to_token_pool,
+        )
+    else:
         # Original path: allocate full extend tokens
+        # The compression attention backend uses save_kv_cache=True so that FlashAttention
+        # can read complete KV for all extend tokens (including query tokens for CPU-hit reqs).
+        # After FlashAttention, the backend compresses the KV in-place, updates req_to_token,
+        # and frees the excess pool slots.
         if batch.tree_cache.page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
         else:

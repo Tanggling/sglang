@@ -291,6 +291,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    
+    # For KV compression: compressed total length for each request
+    compressed_total_lens_cpu: Optional[List[int]] = None
 
     # For split prefill
     # intermediate values for split prefill
@@ -427,6 +430,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             reqs=batch.reqs,
+            compressed_total_lens_cpu=batch.compressed_total_lens_cpu,
         )
         device = model_runner.device
 

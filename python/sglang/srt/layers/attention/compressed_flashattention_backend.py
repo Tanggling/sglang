@@ -30,7 +30,7 @@ import logging
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend, flash_attn_varlen_func
 from sglang.srt.layers.attention.compression_metrics import (
     get_metrics,
     CudaTimer,
@@ -122,6 +122,15 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         self.v_buffer = runner.token_to_kv_pool.v_buffer
 
         # ------------------------------------------------------------------ #
+        # GlobalKVPool for global/real split design
+        # ------------------------------------------------------------------ #
+        self.global_kv_pool = getattr(runner, 'global_kv_pool', None)
+        if self.global_kv_pool is not None:
+            logger.info(
+                f"[KV Compress] Using GlobalKVPool with max_tokens={self.global_kv_pool.max_tokens}"
+            )
+
+        # ------------------------------------------------------------------ #
         # Feature 2: CPU Prefix Cache (default: enabled)
         # ------------------------------------------------------------------ #
         if cpu_prefix_cache is not None:
@@ -207,17 +216,25 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         """
-        Global/Real split prefill with CPU prefix cache support.
+        Global/Real split prefill with GlobalKVPool support.
+
+        NEW DESIGN:
+        - prepare_for_extend allocates compressed total length slots (compressed_total_len)
+        - compressed_total_len = compression_ratio * (prefix_len + extend_len)
+        - Both prefix and extend are compressed together
+        - forward_extend uses GlobalKVPool for full KV during FlashAttention
+        - After compression, compressed KV is written to real_slots
+        - GlobalKVPool slots are freed for reuse by next layer
 
         CPU prefix cache (``self.cpu_prefix_cache`` is set)
         ---------------------------------------------------
         **Cache miss** (first occurrence):
           - FlashAttention with full self-attention.
           - Save full K, V, and Q per layer to ``cpu_prefix_cache``.
-          - Compress and free excess slots.
+          - Compress and write to real_slots.
 
         **Cache hit** (prefix of input matches a cached entry):
-          - Prefix KV loaded from CPU into pre-allocated prefix pool slots.
+          - Prefix KV loaded from CPU into GlobalKVPool.
           - Model only processes unmatched extend tokens (query).
           - FlashAttention: Q = extend only, KV = prefix + extend.
           - For compression importance estimation: if the current query length
@@ -239,6 +256,307 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
         do_cpu = self.cpu_prefix_cache is not None
 
+        # Get GlobalKVPool from runner
+        global_kv_pool = getattr(self, 'global_kv_pool', None)
+        if global_kv_pool is None:
+            # Fallback to old behavior if GlobalKVPool is not available
+            return self._forward_extend_global_real_split_legacy(
+                q, k, v, layer, forward_batch, **kwargs
+            )
+
+        # ── Layer-0 initialisation ─────────────────────────────────────────
+        if layer_id == 0:
+            forward_batch._gr_real_slots: Dict[int, torch.Tensor] = {}
+            forward_batch._gr_compressed_lens: List[int] = []
+            forward_batch._gr_global_slots: Dict[int, torch.Tensor] = {}
+            forward_batch._gr_cpu_prefix_lens: Dict[int, int] = {}  # Store prefix lengths
+
+            forward_batch._cpu_miss_set: set = set()
+            _metrics = get_metrics()
+            if do_cpu:
+                reqs = getattr(forward_batch, "reqs", None)
+                if reqs is not None:
+                    req_pool_indices_now = forward_batch.req_pool_indices
+                    batch_size_now = metadata.cu_seqlens_q.shape[0] - 1
+                    for _si in range(batch_size_now):
+                        _req = reqs[_si]
+                        _req_id = req_pool_indices_now[_si].item()
+                        _match_len = getattr(_req, "cpu_match_len", 0)
+                        if _match_len > 0:
+                            forward_batch._gr_cpu_prefix_lens[_si] = _match_len
+                            _entry = _req.cpu_prefix_entry
+                            _metrics.log_cpu_cache_hit(
+                                _req_id, match_len=_match_len,
+                                entry_len=_entry.seq_len,
+                            )
+                        else:
+                            self.cpu_prefix_cache.start_accumulating(_req_id)
+                            forward_batch._cpu_miss_set.add(_si)
+                            _metrics.log_cpu_cache_miss(_req_id)
+
+        cu_seqlens_q = metadata.cu_seqlens_q
+        batch_size = cu_seqlens_q.shape[0] - 1
+        req_pool_indices = forward_batch.req_pool_indices
+        
+        # Get compressed total lengths from schedule_batch
+        # This is the pre-allocated compressed length for each sequence
+        compressed_total_lens_cpu = getattr(forward_batch, "compressed_total_lens_cpu", None)
+        if compressed_total_lens_cpu is None:
+            # Fallback: compute from extend lengths (no compression)
+            compressed_total_lens_cpu = [
+                cu_seqlens_q[i + 1].item() - cu_seqlens_q[i].item()
+                for i in range(batch_size)
+            ]
+        
+        # Build cu_seqlens for compressed slots
+        cu_seqlens_compressed = [0]
+        for _cl in compressed_total_lens_cpu:
+            cu_seqlens_compressed.append(cu_seqlens_compressed[-1] + _cl)
+        
+        real_cache_loc = forward_batch.out_cache_loc  # This is compressed total length
+        cpu_prefix_lens = getattr(forward_batch, "_gr_cpu_prefix_lens", {})
+        cpu_miss_set = getattr(forward_batch, "_cpu_miss_set", set())
+        reqs = getattr(forward_batch, "reqs", None)
+        _metrics = get_metrics()
+
+        q_view = q.view(-1, num_heads, head_dim)
+        all_compressed_lens: List[int] = getattr(forward_batch, "_gr_compressed_lens", [])
+
+        # Compressor window size for Q padding
+        _window_size = getattr(self.compression_config, 'window_size', 64)
+
+        # ── Per-sequence processing ─────────────────────────────────────────
+        all_k_for_attn = []
+        all_v_for_attn = []
+        all_cu_seqlens_k = [0]
+        max_seqlen_k = 0
+
+        for seq_idx in range(batch_size):
+            q_start = cu_seqlens_q[seq_idx].item()
+            q_end = cu_seqlens_q[seq_idx + 1].item()
+            extend_len = q_end - q_start
+
+            req_id = req_pool_indices[seq_idx].item()
+            _prefix_len = cpu_prefix_lens.get(seq_idx, 0)
+            
+            # Get real_slots for this sequence based on compressed_total_lens
+            comp_start = cu_seqlens_compressed[seq_idx]
+            comp_end = cu_seqlens_compressed[seq_idx + 1]
+            real_slots_seq = real_cache_loc[comp_start:comp_end]
+
+            # ── Determine full sequence length ───────────────────────────────
+            full_seq_len = _prefix_len + extend_len
+
+            if full_seq_len == 0:
+                if layer_id == 0:
+                    all_compressed_lens.append(0)
+                all_cu_seqlens_k.append(all_cu_seqlens_k[-1])
+                continue
+
+            # ── Allocate GlobalKVPool slots for full KV ─────────────────────
+            if layer_id == 0:
+                global_slots = global_kv_pool.alloc(full_seq_len)
+                if global_slots is None:
+                    raise RuntimeError(
+                        f"GlobalKVPool out of memory. Requested {full_seq_len} tokens, "
+                        f"available {global_kv_pool.available_size()}"
+                    )
+                forward_batch._gr_global_slots[seq_idx] = global_slots
+            else:
+                global_slots = forward_batch._gr_global_slots[seq_idx]
+
+            # ── Load CPU prefix KV into GlobalKVPool ────────────────────────
+            if _prefix_len > 0:
+                _req = reqs[seq_idx]
+                _entry = _req.cpu_prefix_entry
+                _k_doc, _v_doc = self.cpu_prefix_cache.load_layer_to_gpu(
+                    _entry, layer_id, str(device), num_tokens=_prefix_len
+                )
+                global_kv_pool.write_kv(global_slots[:_prefix_len], _k_doc, _v_doc)
+
+            # ── Write extend KV to GlobalKVPool ─────────────────────────────
+            if extend_len > 0:
+                k_extend = k[q_start:q_end]
+                v_extend = v[q_start:q_end]
+                global_kv_pool.write_kv(
+                    global_slots[_prefix_len:_prefix_len + extend_len],
+                    k_extend, v_extend
+                )
+
+            # ── Read full KV from GlobalKVPool for attention ────────────────
+            k_full, v_full = global_kv_pool.read_kv(global_slots)
+            all_k_for_attn.append(k_full)
+            all_v_for_attn.append(v_full)
+            all_cu_seqlens_k.append(all_cu_seqlens_k[-1] + full_seq_len)
+            max_seqlen_k = max(max_seqlen_k, full_seq_len)
+
+            # ── Save full KQV to CPU for miss sequences ────────────────────
+            if do_cpu and seq_idx in cpu_miss_set:
+                q_seq_for_save = q_view[q_start:q_end]
+                self.cpu_prefix_cache.accumulate_layer_kqv(
+                    req_id, layer_id, k_full, v_full, q_seq_for_save
+                )
+
+            # ── Build Q for compression importance estimation ──────────────
+            if _prefix_len > 0 and extend_len < _window_size:
+                _req = reqs[seq_idx]
+                _entry = _req.cpu_prefix_entry
+                _need_from_cpu = min(_window_size - extend_len, _prefix_len)
+                _q_pad = self.cpu_prefix_cache.load_query_to_gpu(
+                    _entry, layer_id, str(device),
+                    start=_prefix_len - _need_from_cpu,
+                    end=_prefix_len,
+                )
+                if extend_len > 0:
+                    q_for_compress = torch.cat([_q_pad, q_view[q_start:q_end]], dim=0)
+                else:
+                    q_for_compress = _q_pad
+            else:
+                q_for_compress = q_view[q_start:q_end]
+
+            # ── Compress: select important tokens from the full sequence ───
+            _, _, keep_indices = self._estimate_importance(
+                method=self.importance_method,
+                q=q_for_compress,
+                k=k_full,
+                v=v_full,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                scaling=layer.scaling,
+            )
+
+            is_per_head = keep_indices is not None and keep_indices.dim() == 2
+            if keep_indices is None:
+                num_to_keep = full_seq_len
+            elif is_per_head:
+                num_to_keep = keep_indices.shape[1]
+            else:
+                num_to_keep = keep_indices.shape[0]
+
+            # ── Determine real_slots at layer 0 ────────────────────────────
+            if layer_id == 0:
+                # Use pre-allocated real_cache_loc (compressed length)
+                # The pre-allocated length should match num_to_keep
+                real_slots = real_slots_seq[:num_to_keep]
+                
+                forward_batch.req_to_token_pool.write(
+                    (req_id, slice(0, num_to_keep)), real_slots
+                )
+
+                forward_batch._gr_real_slots[seq_idx] = real_slots
+                all_compressed_lens.append(num_to_keep)
+
+                _metrics.log_compression(
+                    req_id, original_len=full_seq_len, compressed_len=num_to_keep
+                )
+            else:
+                real_slots = forward_batch._gr_real_slots[seq_idx]
+                num_to_keep = real_slots.shape[0]
+
+            # ── Write compressed KV to real_slots ──────────────────────────
+            self._write_compressed_to_real(
+                layer_id=layer_id,
+                k_seq=k_full,
+                v_seq=v_full,
+                keep_indices=keep_indices,
+                is_per_head=is_per_head,
+                num_to_keep=num_to_keep,
+                real_slots=real_slots,
+                num_kv_heads=num_kv_heads,
+            )
+
+        # ── FlashAttention with full KV from GlobalKVPool ───────────────────
+        if len(all_k_for_attn) > 0:
+            k_all = torch.cat(all_k_for_attn, dim=0)
+            v_all = torch.cat(all_v_for_attn, dim=0)
+            cu_seqlens_k_tensor = torch.tensor(all_cu_seqlens_k, dtype=torch.int32, device=device)
+
+            output = flash_attn_varlen_func(
+                q=q_view,
+                k=k_all,
+                v=v_all,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k_tensor,
+                max_seqlen_q=metadata.max_seq_len_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=layer.scaling,
+                causal=True,
+            )
+        else:
+            output = torch.zeros_like(q_view)
+
+        # ── Free GlobalKVPool slots ─────────────────────────────────────────
+        if layer_id == num_layers - 1:
+            global_slots_to_free = getattr(forward_batch, "_gr_global_slots", {})
+            for slots in global_slots_to_free.values():
+                global_kv_pool.free(slots)
+
+            if do_cpu and cpu_miss_set:
+                _input_ids_list = forward_batch.input_ids.cpu().tolist()
+                for _si in cpu_miss_set:
+                    _qs = cu_seqlens_q[_si].item()
+                    _qe = cu_seqlens_q[_si + 1].item()
+                    _toks = _input_ids_list[_qs:_qe]
+                    _req_id = req_pool_indices[_si].item()
+                    self.cpu_prefix_cache.finalize_entry(_req_id, _toks)
+
+        forward_batch._gr_compressed_lens = all_compressed_lens
+        forward_batch.kv_compressed_lens = [num_to_keep + 1 for num_to_keep in all_compressed_lens]
+
+        # Log compression metrics
+        if layer_id == num_layers - 1:
+            _cm = get_metrics()
+            if _cm.total_requests > 0:
+                _avg_ratio = (
+                    _cm.total_compressed_tokens / _cm.total_original_tokens
+                    if _cm.total_original_tokens > 0 else 0.0
+                )
+                _total_lookups = _cm.cpu_cache_hits + _cm.cpu_cache_misses
+                _hit_rate = _cm.cpu_cache_hits / _total_lookups if _total_lookups > 0 else 0.0
+                _msg = (
+                    f"[KV Compress] reqs: {_cm.total_requests}, "
+                    f"avg ratio: {_avg_ratio:.1%} kept, "
+                    f"cpu cache hit: {_cm.cpu_cache_hits}/{_total_lookups} ({_hit_rate:.0%})"
+                )
+                if _cm.cpu_cache_hits > 0:
+                    _msg += f", avg match: {_cm.cpu_total_match_tokens / _cm.cpu_cache_hits:.0f} tokens"
+                    _msg += f", avg transfer: {_cm.total_cpu_transfer_ms / _cm.cpu_cache_hits:.1f}ms"
+                if _cm.total_requests > 0:
+                    _msg += f", avg prefill: {_cm.total_prefill_ms / _cm.total_requests:.1f}ms"
+                    _msg += f", avg compress: {_cm.total_compress_ms / _cm.total_requests:.1f}ms"
+                if _cm.decode_steps > 0:
+                    _msg += f", avg decode: {_cm.total_decode_ms / _cm.decode_steps:.2f}ms"
+                logger.info(_msg)
+
+        return output
+
+    def _forward_extend_global_real_split_legacy(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Legacy Global/Real split prefill (fallback when GlobalKVPool is not available).
+
+        This is the original implementation that allocates full extend length slots
+        and then frees excess slots after compression.
+        """
+        layer_id = layer.layer_id
+        num_heads = layer.tp_q_head_num
+        num_kv_heads = layer.tp_k_head_num
+        head_dim = layer.head_dim
+        num_layers = len(self.k_buffer)
+        device = k.device
+
+        metadata = self.forward_metadata
+
+        do_cpu = self.cpu_prefix_cache is not None
+
         # ── Layer-0 initialisation ─────────────────────────────────────────
         if layer_id == 0:
             forward_batch._gr_real_slots: Dict[int, torch.Tensor] = {}
@@ -248,11 +566,10 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
             forward_batch._cpu_miss_set: set = set()
             _metrics = get_metrics()
-            # do_cpu = False # self.cpu_prefix_cache is not None
             if do_cpu:
                 reqs = getattr(forward_batch, "reqs", None)
                 if reqs is not None:
-                    req_pool_indices_now = forward_batch.req_pool_indices # [bsz]
+                    req_pool_indices_now = forward_batch.req_pool_indices
                     batch_size_now = metadata.cu_seqlens_q.shape[0] - 1
                     for _si in range(batch_size_now):
                         _req = reqs[_si]
@@ -296,11 +613,6 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 _metrics.log_cpu_transfer_time(_req_id, _t_transfer.elapsed_ms)
 
         # ── FlashAttention forward pass ───────────────────────────────────
-        # For CPU-hit: Q = extend tokens only; KV = prefix (from CPU) + extend.
-        # For CPU-miss: Q = all tokens; KV = all tokens.
-        # For fully matched (extend_len=0): cu_seqlens_q has zero-length
-        # segment → FlashAttention produces no output for that sequence,
-        # which is correct (no new tokens to compute).
         with CudaTimer() as _t_prefill:
             output = super().forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
@@ -320,7 +632,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         for seq_idx in range(batch_size):
             q_start = cu_seqlens_q[seq_idx].item()
             q_end = cu_seqlens_q[seq_idx + 1].item()
-            extend_len = q_end - q_start  # query tokens for this seq
+            extend_len = q_end - q_start
 
             req_id = req_pool_indices[seq_idx].item()
             _prefix_slots = cpu_prefix_slots.get(seq_idx, None)
@@ -328,7 +640,6 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
             # ── Determine full K/V ─────────────────────────────────────────
             if _prefix_slots is not None:
-                # CPU-hit: combine prefix KV + extend KV
                 k_doc = self.k_buffer[layer_id][_prefix_slots]
                 v_doc = self.v_buffer[layer_id][_prefix_slots]
                 if extend_len > 0:
@@ -341,7 +652,6 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                     v_full = v_doc
                 full_seq_len = _prefix_slots.shape[0] + extend_len
             else:
-                # CPU-miss: all KV from extend
                 k_full = self.k_buffer[layer_id][extend_cache_loc]
                 v_full = self.v_buffer[layer_id][extend_cache_loc]
                 full_seq_len = extend_len
@@ -359,16 +669,11 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 )
 
             # ── Build Q for compression importance estimation ──────────────
-            # If current extend Q is shorter than window_size, load stored Q
-            # from CPU to pad.  This handles:
-            #   - Partial match: extend_len < window_size → pad from CPU Q
-            #   - Full match:    extend_len = 0 → use CPU Q entirely
             if _prefix_slots is not None and extend_len < _window_size:
                 _req = reqs[seq_idx]
                 _entry = _req.cpu_prefix_entry
                 _match_len = _prefix_slots.shape[0]
                 _need_from_cpu = min(_window_size - extend_len, _match_len)
-                # Take the TAIL of matched Q (most recent context)
                 _q_pad = self.cpu_prefix_cache.load_query_to_gpu(
                     _entry, layer_id, str(device),
                     start=_match_len - _need_from_cpu,
@@ -457,37 +762,6 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
         forward_batch._gr_compressed_lens = all_compressed_lens
         forward_batch.kv_compressed_lens = [num_to_keep + 1 for num_to_keep in all_compressed_lens]
-
-        # Log compression metrics directly from model worker process
-        if layer_id == num_layers - 1:
-            _cm = get_metrics()
-            if _cm.total_requests > 0:
-                _avg_ratio = (
-                    _cm.total_compressed_tokens / _cm.total_original_tokens
-                    if _cm.total_original_tokens > 0 else 0.0
-                )
-                _total_lookups = _cm.cpu_cache_hits + _cm.cpu_cache_misses
-                _hit_rate = _cm.cpu_cache_hits / _total_lookups if _total_lookups > 0 else 0.0
-                _msg = (
-                    f"[KV Compress] reqs: {_cm.total_requests}, "
-                    f"avg ratio: {_avg_ratio:.1%} kept, "
-                    f"cpu cache hit: {_cm.cpu_cache_hits}/{_total_lookups} ({_hit_rate:.0%})"
-                )
-                if _cm.cpu_cache_hits > 0:
-                    _msg += f", avg match: {_cm.cpu_total_match_tokens / _cm.cpu_cache_hits:.0f} tokens"
-                    _msg += f", avg transfer: {_cm.total_cpu_transfer_ms / _cm.cpu_cache_hits:.1f}ms"
-                if _cm.total_requests > 0:
-                    _msg += f", avg prefill: {_cm.total_prefill_ms / _cm.total_requests:.1f}ms"
-                    _msg += f", avg compress: {_cm.total_compress_ms / _cm.total_requests:.1f}ms"
-                if _cm.decode_steps > 0:
-                    _msg += f", avg decode: {_cm.total_decode_ms / _cm.decode_steps:.2f}ms"
-                logger.info(_msg)
-
-        # NOTE: seq_lens is NOT updated here.  The scheduler updates
-        # batch.seq_lens from batch_result.kv_compressed_lens after the
-        # forward pass returns (scheduler.py L2401-2407).  That assignment
-        # happens before prepare_for_decode / alloc_for_decode, so the
-        # decode phase correctly sees the compressed length.
 
         return output
 

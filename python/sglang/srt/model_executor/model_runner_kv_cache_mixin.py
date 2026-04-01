@@ -740,6 +740,34 @@ class ModelRunnerKVCacheMixin:
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
 
+        # Initialize GlobalKVPool for KV compression
+        # This pool is used to store full KV cache during prefill before compression
+        if self.server_args.kv_compression_ratio > 0.0:
+            from sglang.srt.mem_cache.global_kv_pool import GlobalKVPool
+
+            # Determine the maximum tokens needed for global pool
+            # This should be the maximum sequence length in a batch
+            max_global_tokens = min(
+                self.model_config.context_len,
+                self.max_total_num_tokens,
+            )
+
+            self.global_kv_pool = GlobalKVPool(
+                max_tokens=max_global_tokens,
+                num_kv_heads=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                head_dim=self.model_config.head_dim,
+                v_head_dim=None,  # Use same as head_dim
+                dtype=self.kv_cache_dtype,
+                device=self.device,
+            )
+            logger.info(
+                f"Initialized GlobalKVPool for KV compression: "
+                f"max_tokens={max_global_tokens}, "
+                f"mem_usage={self.global_kv_pool.mem_usage_bytes() / 1024**3:.2f} GB"
+            )
+        else:
+            self.global_kv_pool = None
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"

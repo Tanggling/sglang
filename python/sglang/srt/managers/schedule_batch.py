@@ -1468,7 +1468,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # before FlashAttention.  If query is too short for compression,
         # the backend loads stored Q from CPU to pad to window_size.
         from sglang.srt.mem_cache.prefix_cpu_cache import get_global_cpu_prefix_cache
-        from sglang.srt.mem_cache.common import alloc_token_slots
 
         _cpu_cache = get_global_cpu_prefix_cache()
         if _cpu_cache is not None:
@@ -1478,8 +1477,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 _hit = _cpu_cache.lookup_prefix(req.fill_ids)
                 if _hit is not None:
                     _match_len, _entry = _hit
-                    _doc_slots = alloc_token_slots(self.tree_cache, _match_len)
-                    req.prefix_indices = _doc_slots
+                    # NEW: Don't allocate prefix slots here, will use global_kv_buffer
+                    # req.prefix_indices = _doc_slots  # Removed: no longer allocate prefix slots
                     req.cpu_prefix_entry = _entry
                     req.cpu_match_len = _match_len
                     req.set_extend_input_len(len(req.fill_ids) - _match_len)
@@ -1488,7 +1487,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
-        prefix_lens = [len(r.prefix_indices) for r in reqs]
+        # prefix_lens includes both radix cache prefix and CPU cache prefix
+        # For CPU-hit reqs: prefix_len = cpu_match_len (not from prefix_indices)
+        # For non-CPU-hit reqs: prefix_len = len(prefix_indices) (from radix cache)
+        prefix_lens = []
+        for r in reqs:
+            if hasattr(r, 'cpu_match_len') and r.cpu_match_len > 0:
+                # CPU cache hit: use cpu_match_len as prefix length
+                prefix_lens.append(r.cpu_match_len)
+            else:
+                # Radix cache hit or no prefix: use prefix_indices length
+                prefix_lens.append(len(r.prefix_indices))
         extend_lens = [r.extend_input_len for r in reqs]
 
         # For matryoshka embeddings
@@ -1528,37 +1537,41 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
-        # Pre-compute compressed extend lengths for the global/real split KV compression.
-        # Pre-compute compressed_extend_lens_cpu for the attention backend.
-        # IMPORTANT: out_cache_loc is still allocated for the full extend_len.
-        # The attention backend uses save_kv_cache=True so FlashAttention gets correct
-        # full-context KV.  After FlashAttention, the backend reads back from pool,
-        # compresses, writes the compressed subset in-place, updates req_to_token, and
-        # frees the excess slots.
+        # Pre-compute compressed total lengths for the global/real split KV compression.
+        # NEW DESIGN: Allocate only compressed length slots during prepare_for_extend.
+        # compressed_total_lens = compression_ratio * (prefix_len + extend_len)
+        # This includes BOTH compressed prefix and compressed extend parts.
         _sa = get_global_server_args()
         _ratio = _sa.kv_compression_ratio
+        use_compressed_allocation = False
         if _ratio > 0.0:
             _min_tok = _sa.kv_compression_min_tokens
             _win = _sa.kv_compression_window_size
             _comp_lens = []
             for _pl, _el in zip(prefix_lens, extend_lens):
-                # _pl = doc_len for CPU-hit reqs, 0 for non-hit reqs
-                # _el = query_len for CPU-hit, all_tokens for non-hit
+                # _pl = prefix length (from radix cache or CPU cache)
+                # _el = extend length (new tokens to process)
                 # Target compressed length based on the full context (prefix + extend).
                 _full_len = _pl + _el
                 if _full_len <= _min_tok or _full_len <= _win:
+                    # Don't compress if sequence is too short
                     _comp_lens.append(_full_len)
                 else:
+                    # Compress to (1 - ratio) of full length
                     _comp_lens.append(max(_min_tok, int(_full_len * (1.0 - _ratio))))
-            self.compressed_extend_lens_cpu = _comp_lens
-            self.compressed_extend_num_tokens = sum(_comp_lens)
+            # This is the compressed TOTAL length (prefix + extend compressed together)
+            self.compressed_total_lens_cpu = _comp_lens
+            self.compressed_total_num_tokens = sum(_comp_lens)
+            # Enable compressed allocation when compression is configured
+            use_compressed_allocation = True
         else:
-            self.compressed_extend_lens_cpu = None
-            self.compressed_extend_num_tokens = None
+            self.compressed_total_lens_cpu = None
+            self.compressed_total_num_tokens = None
 
         # Allocate memory
+        # Use compressed length allocation when KV compression is enabled
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-            self
+            self, use_compressed_len=use_compressed_allocation
         )
 
         # Set fields
@@ -2261,6 +2274,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
+            compressed_total_lens_cpu=self.compressed_total_lens_cpu,
             multimodal_inputs=self.multimodal_inputs,
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
@@ -2427,6 +2441,9 @@ class ModelWorkerBatch:
     extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
     extend_input_logprob_token_ids: Optional[torch.Tensor]
+    
+    # For KV compression: compressed total length for each request
+    compressed_total_lens_cpu: Optional[List[int]] = None
 
     # For multimodal
     multimodal_inputs: Optional[List[MultimodalInputs]]
