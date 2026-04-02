@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBac
 from sglang.srt.layers.attention.compression_metrics import (
     get_metrics,
     CudaTimer,
+    LayerAccumTimer,
 )
 
 logger = logging.getLogger(__name__)
@@ -218,30 +219,16 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         """
         Global/Real split prefill with GlobalKVPool support.
 
-        NEW DESIGN:
-        - prepare_for_extend allocates compressed total length slots (compressed_total_len)
-        - compressed_total_len = compression_ratio * (prefix_len + extend_len)
-        - Both prefix and extend are compressed together
-        - forward_extend uses GlobalKVPool for full KV during FlashAttention
-        - After compression, compressed KV is written to real_slots
-        - GlobalKVPool slots are freed for reuse by next layer
+        Flow per layer:
+          1. Assemble full KV in GlobalKVPool (CPU prefix + model extend)
+          2. FlashAttention with full KV → correct output (no quality loss)
+          3. Compress: select important tokens from full KV
+          4. Write compressed KV to real pool slots
+          5. Free GlobalKVPool slots (reused by next layer)
 
-        CPU prefix cache (``self.cpu_prefix_cache`` is set)
-        ---------------------------------------------------
-        **Cache miss** (first occurrence):
-          - FlashAttention with full self-attention.
-          - Save full K, V, and Q per layer to ``cpu_prefix_cache``.
-          - Compress and write to real_slots.
-
-        **Cache hit** (prefix of input matches a cached entry):
-          - Prefix KV loaded from CPU into GlobalKVPool.
-          - Model only processes unmatched extend tokens (query).
-          - FlashAttention: Q = extend only, KV = prefix + extend.
-          - For compression importance estimation: if the current query length
-            is shorter than the compressor's window_size, stored Q is loaded
-            from CPU and prepended to reach window_size.
-          - Fully matched (extend_len = 0): FlashAttention is skipped,
-            Q is loaded entirely from CPU for compression.
+        Memory savings:
+          GlobalKVPool: 1 layer × max_batch_tokens (shared across layers)
+          Real pool:    num_layers × compressed_tokens (permanent for decode)
 
         Layers 1+ reuse ``real_slots`` determined at layer 0.
         """
@@ -257,9 +244,9 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         do_cpu = self.cpu_prefix_cache is not None
 
         # Get GlobalKVPool from runner
-        global_kv_pool = getattr(self, 'global_kv_pool', None)
+        global_kv_pool = self.global_kv_pool
         if global_kv_pool is None:
-            # Fallback to old behavior if GlobalKVPool is not available
+            # Fallback to legacy behavior if GlobalKVPool is not available
             return self._forward_extend_global_real_split_legacy(
                 q, k, v, layer, forward_batch, **kwargs
             )
@@ -268,8 +255,11 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         if layer_id == 0:
             forward_batch._gr_real_slots: Dict[int, torch.Tensor] = {}
             forward_batch._gr_compressed_lens: List[int] = []
-            forward_batch._gr_global_slots: Dict[int, torch.Tensor] = {}
-            forward_batch._gr_cpu_prefix_lens: Dict[int, int] = {}  # Store prefix lengths
+            forward_batch._gr_slots_to_free: List[torch.Tensor] = []
+            forward_batch._gr_cpu_prefix_lens: Dict[int, int] = {}
+            # Timers that accumulate across layers (sync only at last layer)
+            forward_batch._timer_prefill = LayerAccumTimer()
+            forward_batch._timer_compress = LayerAccumTimer()
 
             forward_batch._cpu_miss_set: set = set()
             _metrics = get_metrics()
@@ -297,23 +287,17 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         cu_seqlens_q = metadata.cu_seqlens_q
         batch_size = cu_seqlens_q.shape[0] - 1
         req_pool_indices = forward_batch.req_pool_indices
-        
+
         # Get compressed total lengths from schedule_batch
-        # This is the pre-allocated compressed length for each sequence
         compressed_total_lens_cpu = getattr(forward_batch, "compressed_total_lens_cpu", None)
-        if compressed_total_lens_cpu is None:
-            # Fallback: compute from extend lengths (no compression)
-            compressed_total_lens_cpu = [
-                cu_seqlens_q[i + 1].item() - cu_seqlens_q[i].item()
-                for i in range(batch_size)
-            ]
-        
-        # Build cu_seqlens for compressed slots
+
+        # Build cu_seqlens for compressed slots (to index into out_cache_loc)
         cu_seqlens_compressed = [0]
-        for _cl in compressed_total_lens_cpu:
-            cu_seqlens_compressed.append(cu_seqlens_compressed[-1] + _cl)
-        
-        real_cache_loc = forward_batch.out_cache_loc  # This is compressed total length
+        if compressed_total_lens_cpu is not None:
+            for _cl in compressed_total_lens_cpu:
+                cu_seqlens_compressed.append(cu_seqlens_compressed[-1] + _cl)
+
+        real_cache_loc = forward_batch.out_cache_loc  # Pre-allocated compressed total length
         cpu_prefix_lens = getattr(forward_batch, "_gr_cpu_prefix_lens", {})
         cpu_miss_set = getattr(forward_batch, "_cpu_miss_set", set())
         reqs = getattr(forward_batch, "reqs", None)
@@ -325,11 +309,14 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         # Compressor window size for Q padding
         _window_size = getattr(self.compression_config, 'window_size', 64)
 
-        # ── Per-sequence processing ─────────────────────────────────────────
+        # ── PHASE 1: Assemble full KV in GlobalKVPool ──────────────────────
         all_k_for_attn = []
         all_v_for_attn = []
         all_cu_seqlens_k = [0]
         max_seqlen_k = 0
+
+        # Per-sequence data for phase 3 (compression)
+        seq_data = []  # list of (k_full, v_full, full_seq_len, global_slots, real_slots_seq, ...)
 
         for seq_idx in range(batch_size):
             q_start = cu_seqlens_q[seq_idx].item()
@@ -338,35 +325,38 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
             req_id = req_pool_indices[seq_idx].item()
             _prefix_len = cpu_prefix_lens.get(seq_idx, 0)
-            
-            # Get real_slots for this sequence based on compressed_total_lens
-            comp_start = cu_seqlens_compressed[seq_idx]
-            comp_end = cu_seqlens_compressed[seq_idx + 1]
-            real_slots_seq = real_cache_loc[comp_start:comp_end]
 
-            # ── Determine full sequence length ───────────────────────────────
+            # Get real_slots for this sequence based on compressed_total_lens
+            if compressed_total_lens_cpu is not None:
+                comp_start = cu_seqlens_compressed[seq_idx]
+                comp_end = cu_seqlens_compressed[seq_idx + 1]
+                real_slots_seq = real_cache_loc[comp_start:comp_end]
+            else:
+                real_slots_seq = None
+
             full_seq_len = _prefix_len + extend_len
 
             if full_seq_len == 0:
                 if layer_id == 0:
-                    all_compressed_lens.append(0)
+                    # Use None (not 0) so process_batch_result_prefill skips
+                    # this sequence.  Using 0 would reset kv_committed_len for
+                    # decode requests in mixed batches, leaking all their slots.
+                    all_compressed_lens.append(None)
                 all_cu_seqlens_k.append(all_cu_seqlens_k[-1])
+                seq_data.append(None)
                 continue
 
-            # ── Allocate GlobalKVPool slots for full KV ─────────────────────
-            if layer_id == 0:
-                global_slots = global_kv_pool.alloc(full_seq_len)
-                if global_slots is None:
-                    raise RuntimeError(
-                        f"GlobalKVPool out of memory. Requested {full_seq_len} tokens, "
-                        f"available {global_kv_pool.available_size()}"
-                    )
-                forward_batch._gr_global_slots[seq_idx] = global_slots
-            else:
-                global_slots = forward_batch._gr_global_slots[seq_idx]
+            # ── Allocate GlobalKVPool slots for full KV ────────────────────
+            global_slots = global_kv_pool.alloc(full_seq_len)
+            if global_slots is None:
+                raise RuntimeError(
+                    f"GlobalKVPool out of memory. Requested {full_seq_len} tokens, "
+                    f"available {global_kv_pool.available_size()}"
+                )
 
-            # ── Load CPU prefix KV into GlobalKVPool ────────────────────────
+            # ── Load CPU prefix KV into GlobalKVPool ──────────────────────
             if _prefix_len > 0:
+                
                 _req = reqs[seq_idx]
                 _entry = _req.cpu_prefix_entry
                 _k_doc, _v_doc = self.cpu_prefix_cache.load_layer_to_gpu(
@@ -374,7 +364,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 )
                 global_kv_pool.write_kv(global_slots[:_prefix_len], _k_doc, _v_doc)
 
-            # ── Write extend KV to GlobalKVPool ─────────────────────────────
+            # ── Write extend KV to GlobalKVPool ───────────────────────────
             if extend_len > 0:
                 k_extend = k[q_start:q_end]
                 v_extend = v[q_start:q_end]
@@ -383,21 +373,67 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                     k_extend, v_extend
                 )
 
-            # ── Read full KV from GlobalKVPool for attention ────────────────
+            # ── Read full KV for FA and later compression ─────────────────
             k_full, v_full = global_kv_pool.read_kv(global_slots)
             all_k_for_attn.append(k_full)
             all_v_for_attn.append(v_full)
             all_cu_seqlens_k.append(all_cu_seqlens_k[-1] + full_seq_len)
             max_seqlen_k = max(max_seqlen_k, full_seq_len)
 
-            # ── Save full KQV to CPU for miss sequences ────────────────────
+            # Save full KQV to CPU for miss sequences
             if do_cpu and seq_idx in cpu_miss_set:
                 q_seq_for_save = q_view[q_start:q_end]
                 self.cpu_prefix_cache.accumulate_layer_kqv(
                     req_id, layer_id, k_full, v_full, q_seq_for_save
                 )
 
-            # ── Build Q for compression importance estimation ──────────────
+            seq_data.append((k_full, v_full, full_seq_len, global_slots, real_slots_seq))
+
+        # ── PHASE 2: FlashAttention with full KV ──────────────────────────
+        _timer_prefill = forward_batch._timer_prefill
+        _timer_prefill.mark_start()
+        if len(all_k_for_attn) > 0:
+            k_all = torch.cat(all_k_for_attn, dim=0)
+            v_all = torch.cat(all_v_for_attn, dim=0)
+            cu_seqlens_k_tensor = torch.tensor(
+                all_cu_seqlens_k, dtype=torch.int32, device=device
+            )
+
+            output = flash_attn_varlen_func(
+                q=q_view,
+                k=k_all,
+                v=v_all,
+                cu_seqlens_q=cu_seqlens_q.to(torch.int32),
+                cu_seqlens_k=cu_seqlens_k_tensor,
+                max_seqlen_q=metadata.max_seq_len_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=layer.scaling,
+                causal=True,
+            )
+            # Reshape to [total_q, num_heads * v_head_dim] to match parent's return format
+            output = output.view(-1, num_heads * layer.v_head_dim)
+        else:
+            output = q.new_zeros(q.shape[0], num_heads * layer.v_head_dim)
+        _timer_prefill.mark_end()
+
+        # Free intermediate FA tensors early
+        del all_k_for_attn, all_v_for_attn
+
+        # ── PHASE 3: Per-sequence compression and write to real pool ──────
+        _timer_compress = forward_batch._timer_compress
+        _timer_compress.mark_start()
+        for seq_idx in range(batch_size):
+            if seq_data[seq_idx] is None:
+                continue
+
+            k_full, v_full, full_seq_len, global_slots, real_slots_seq = seq_data[seq_idx]
+            q_start = cu_seqlens_q[seq_idx].item()
+            q_end = cu_seqlens_q[seq_idx + 1].item()
+            extend_len = q_end - q_start
+            req_id = req_pool_indices[seq_idx].item()
+            _prefix_len = cpu_prefix_lens.get(seq_idx, 0)
+
+            # ── Build Q for compression importance estimation ─────────────
             if _prefix_len > 0 and extend_len < _window_size:
                 _req = reqs[seq_idx]
                 _entry = _req.cpu_prefix_entry
@@ -414,7 +450,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             else:
                 q_for_compress = q_view[q_start:q_end]
 
-            # ── Compress: select important tokens from the full sequence ───
+            # ── Compress: select important tokens from the full sequence ──
             _, _, keep_indices = self._estimate_importance(
                 method=self.importance_method,
                 q=q_for_compress,
@@ -434,12 +470,18 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             else:
                 num_to_keep = keep_indices.shape[0]
 
-            # ── Determine real_slots at layer 0 ────────────────────────────
+            # ── Determine real_slots at layer 0 ──────────────────────────
             if layer_id == 0:
-                # Use pre-allocated real_cache_loc (compressed length)
-                # The pre-allocated length should match num_to_keep
-                real_slots = real_slots_seq[:num_to_keep]
-                
+                if real_slots_seq is not None:
+                    real_slots = real_slots_seq[:num_to_keep]
+                    # Free excess pre-allocated slots that won't be used
+                    excess = real_slots_seq[num_to_keep:]
+                    if excess.numel() > 0:
+                        forward_batch._gr_slots_to_free.append(excess)
+                else:
+                    # Fallback: should not happen when compressed allocation is used
+                    real_slots = global_slots[:num_to_keep]
+
                 forward_batch.req_to_token_pool.write(
                     (req_id, slice(0, num_to_keep)), real_slots
                 )
@@ -454,7 +496,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 real_slots = forward_batch._gr_real_slots[seq_idx]
                 num_to_keep = real_slots.shape[0]
 
-            # ── Write compressed KV to real_slots ──────────────────────────
+            # ── Write compressed KV to real pool slots ───────────────────
             self._write_compressed_to_real(
                 layer_id=layer_id,
                 k_seq=k_full,
@@ -466,31 +508,17 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 num_kv_heads=num_kv_heads,
             )
 
-        # ── FlashAttention with full KV from GlobalKVPool ───────────────────
-        if len(all_k_for_attn) > 0:
-            k_all = torch.cat(all_k_for_attn, dim=0)
-            v_all = torch.cat(all_v_for_attn, dim=0)
-            cu_seqlens_k_tensor = torch.tensor(all_cu_seqlens_k, dtype=torch.int32, device=device)
+            # ── Free GlobalKVPool slots immediately (reuse for next layer) ─
+            global_kv_pool.free(global_slots)
 
-            output = flash_attn_varlen_func(
-                q=q_view,
-                k=k_all,
-                v=v_all,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k_tensor,
-                max_seqlen_q=metadata.max_seq_len_q,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=layer.scaling,
-                causal=True,
-            )
-        else:
-            output = torch.zeros_like(q_view)
+        _timer_compress.mark_end()
 
-        # ── Free GlobalKVPool slots ─────────────────────────────────────────
+        # ── After last layer: free excess slots + finalize CPU save ───────
         if layer_id == num_layers - 1:
-            global_slots_to_free = getattr(forward_batch, "_gr_global_slots", {})
-            for slots in global_slots_to_free.values():
-                global_kv_pool.free(slots)
+            # Free excess pre-allocated real slots that weren't used
+            slots_to_free = getattr(forward_batch, "_gr_slots_to_free", [])
+            if slots_to_free:
+                self.token_to_kv_pool_allocator.free(torch.cat(slots_to_free))
 
             if do_cpu and cpu_miss_set:
                 _input_ids_list = forward_batch.input_ids.cpu().tolist()
@@ -502,11 +530,21 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                     self.cpu_prefix_cache.finalize_entry(_req_id, _toks)
 
         forward_batch._gr_compressed_lens = all_compressed_lens
-        forward_batch.kv_compressed_lens = [num_to_keep + 1 for num_to_keep in all_compressed_lens]
+        forward_batch.kv_compressed_lens = [
+            (n + 1 if n is not None else None) for n in all_compressed_lens
+        ]
 
-        # Log compression metrics
+        # ── Sync timers and log metrics at last layer ─────────────────────
         if layer_id == num_layers - 1:
+            _prefill_total_ms = forward_batch._timer_prefill.sync_and_total()
+            _compress_total_ms = forward_batch._timer_compress.sync_and_total()
+
             _cm = get_metrics()
+            for _si in range(batch_size):
+                _req_id = req_pool_indices[_si].item()
+                _cm.log_prefill_time(_req_id, _prefill_total_ms / max(batch_size, 1))
+                _cm.log_compress_time(_req_id, _compress_total_ms / max(batch_size, 1))
+
             if _cm.total_requests > 0:
                 _avg_ratio = (
                     _cm.total_compressed_tokens / _cm.total_original_tokens
@@ -523,10 +561,10 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                     _msg += f", avg match: {_cm.cpu_total_match_tokens / _cm.cpu_cache_hits:.0f} tokens"
                     _msg += f", avg transfer: {_cm.total_cpu_transfer_ms / _cm.cpu_cache_hits:.1f}ms"
                 if _cm.total_requests > 0:
-                    _msg += f", avg prefill: {_cm.total_prefill_ms / _cm.total_requests:.1f}ms"
-                    _msg += f", avg compress: {_cm.total_compress_ms / _cm.total_requests:.1f}ms"
+                    _msg += f", avg prefill(all layers): {_cm.total_prefill_ms / _cm.total_requests:.1f}ms"
+                    _msg += f", avg compress(all layers): {_cm.total_compress_ms / _cm.total_requests:.1f}ms"
                 if _cm.decode_steps > 0:
-                    _msg += f", avg decode: {_cm.total_decode_ms / _cm.decode_steps:.2f}ms"
+                    _msg += f", avg decode(all layers): {_cm.total_decode_ms / _cm.decode_steps:.2f}ms/token"
                 logger.info(_msg)
 
         return output
@@ -658,7 +696,10 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
             if full_seq_len == 0:
                 if layer_id == 0:
-                    all_compressed_lens.append(0)
+                    # Use None (not 0) so process_batch_result_prefill skips
+                    # this sequence.  Using 0 would reset kv_committed_len for
+                    # decode requests in mixed batches, leaking all their slots.
+                    all_compressed_lens.append(None)
                 continue
 
             # Save full KQV to CPU for miss sequences
@@ -761,7 +802,9 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                     self.cpu_prefix_cache.finalize_entry(_req_id, _toks)
 
         forward_batch._gr_compressed_lens = all_compressed_lens
-        forward_batch.kv_compressed_lens = [num_to_keep + 1 for num_to_keep in all_compressed_lens]
+        forward_batch.kv_compressed_lens = [
+            (n + 1 if n is not None else None) for n in all_compressed_lens
+        ]
 
         return output
 

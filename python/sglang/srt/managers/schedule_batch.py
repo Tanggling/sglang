@@ -1468,8 +1468,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # before FlashAttention.  If query is too short for compression,
         # the backend loads stored Q from CPU to pad to window_size.
         from sglang.srt.mem_cache.prefix_cpu_cache import get_global_cpu_prefix_cache
+        from sglang.srt.mem_cache.common import alloc_token_slots
 
         _cpu_cache = get_global_cpu_prefix_cache()
+        _sa = get_global_server_args()
+        _use_global_kv = _sa.kv_compression_ratio > 0.0
         if _cpu_cache is not None:
             for req in reqs:
                 if len(req.prefix_indices) > 0:
@@ -1477,8 +1480,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 _hit = _cpu_cache.lookup_prefix(req.fill_ids)
                 if _hit is not None:
                     _match_len, _entry = _hit
-                    # NEW: Don't allocate prefix slots here, will use global_kv_buffer
-                    # req.prefix_indices = _doc_slots  # Removed: no longer allocate prefix slots
+                    if _use_global_kv:
+                        # Global KV buffer mode: don't allocate pool slots for prefix.
+                        # Set prefix_indices to a dummy tensor of correct length so that
+                        # input_ids slicing and prefix_lens computation work correctly.
+                        # The actual KV will be loaded into GlobalKVPool by the backend.
+                        req.prefix_indices = torch.zeros(
+                            _match_len, dtype=torch.int64, device="cpu"
+                        )
+                    else:
+                        # Legacy mode: allocate real pool slots for prefix
+                        _doc_slots = alloc_token_slots(self.tree_cache, _match_len)
+                        req.prefix_indices = _doc_slots
                     req.cpu_prefix_entry = _entry
                     req.cpu_match_len = _match_len
                     req.set_extend_input_len(len(req.fill_ids) - _match_len)
@@ -1487,17 +1500,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
-        # prefix_lens includes both radix cache prefix and CPU cache prefix
-        # For CPU-hit reqs: prefix_len = cpu_match_len (not from prefix_indices)
-        # For non-CPU-hit reqs: prefix_len = len(prefix_indices) (from radix cache)
-        prefix_lens = []
-        for r in reqs:
-            if hasattr(r, 'cpu_match_len') and r.cpu_match_len > 0:
-                # CPU cache hit: use cpu_match_len as prefix length
-                prefix_lens.append(r.cpu_match_len)
-            else:
-                # Radix cache hit or no prefix: use prefix_indices length
-                prefix_lens.append(len(r.prefix_indices))
+        prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
         # For matryoshka embeddings
