@@ -5,6 +5,7 @@ Collects and reports metrics for:
   1. Compression: original length, compressed length, ratio per request
   2. CPU Prefix Cache: hit/miss counts, match lengths, partial-match ratios
   3. Timing: prefill, CPU→GPU transfer, compression, decode per step
+  4. Per-request lifecycle: full prefill+decode timing for each request
 
 Usage:
     from sglang.srt.layers.attention.compression_metrics import get_metrics
@@ -12,7 +13,9 @@ Usage:
     metrics = get_metrics()
     metrics.log_compression(req_id, original_len=1000, compressed_len=500)
     metrics.log_cpu_cache_hit(req_id, match_len=500, entry_len=1000)
-    metrics.report()      # print summary
+    metrics.log_decode_step([req_id_1, req_id_2], batch_ms=1.5)
+    metrics.finalize_request(req_id)   # logs per-request summary
+    metrics.report()      # print global summary
     metrics.reset()       # clear all stats
 """
 
@@ -66,29 +69,89 @@ class CudaTimer:
             self.elapsed_ms = (time.perf_counter() - self._t0) * 1000.0
 
 
-# ─── Per-request snapshot ─────────────────────────────────────────────────────
+class LayerAccumTimer:
+    """Non-blocking CUDA event timer that accumulates across transformer layers.
+
+    Usage:
+        timer = LayerAccumTimer()
+        # In each layer:
+        timer.mark_start()
+        ...  # GPU work
+        timer.mark_end()
+        # After all layers:
+        total_ms = timer.sync_and_total()
+
+    Events are recorded without synchronization during forward passes.
+    ``sync_and_total()`` synchronizes once at the end and sums up all
+    (start, end) pairs to return the total elapsed milliseconds.
+    """
+
+    def __init__(self):
+        self._pairs: List[tuple] = []  # list of (start_event, end_event)
+        self._current_start = None
+        self._use_cuda = torch.cuda.is_available()
+
+    def mark_start(self):
+        if self._use_cuda:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            self._current_start = ev
+        else:
+            self._current_start = time.perf_counter()
+
+    def mark_end(self):
+        if self._current_start is None:
+            return
+        if self._use_cuda:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            self._pairs.append((self._current_start, ev))
+        else:
+            elapsed = (time.perf_counter() - self._current_start) * 1000.0
+            self._pairs.append(elapsed)
+        self._current_start = None
+
+    def sync_and_total(self) -> float:
+        """Synchronize GPU and return total accumulated time in milliseconds."""
+        if self._use_cuda:
+            torch.cuda.synchronize()
+            total = 0.0
+            for start_ev, end_ev in self._pairs:
+                total += start_ev.elapsed_time(end_ev)
+            self._pairs.clear()
+            return total
+        else:
+            total = sum(self._pairs)
+            self._pairs.clear()
+            return total
+
+
+# ─── Per-request lifecycle tracker ───────────────────────────────────────────
 
 
 @dataclass
-class RequestMetricSnapshot:
-    """Metrics collected for a single request during one forward pass."""
+class RequestMetrics:
+    """Tracks the full lifecycle of a single request (prefill → decode → finish)."""
 
     req_id: int = -1
 
-    # Compression
+    # Compression info
     original_len: int = 0
     compressed_len: int = 0
 
     # CPU prefix cache
     cpu_cache_hit: bool = False
-    cpu_match_len: int = 0  # actual matched prefix tokens
-    cpu_entry_len: int = 0  # total tokens in the cached entry
+    cpu_match_len: int = 0
+    cpu_entry_len: int = 0
 
-    # Timing (ms)
-    prefill_ms: float = 0.0  # FlashAttention extend forward
-    cpu_transfer_ms: float = 0.0  # CPU→GPU KV transfer (all layers)
-    compress_ms: float = 0.0  # importance estimation + write compressed
-    decode_ms: float = 0.0  # single decode step
+    # Timing (ms) — all accumulated across layers
+    prefill_ms: float = 0.0
+    cpu_transfer_ms: float = 0.0
+    compress_ms: float = 0.0
+
+    # Decode timing — accumulated across all decode steps
+    decode_total_ms: float = 0.0
+    decode_steps: int = 0
 
 
 # ─── Aggregated counters ─────────────────────────────────────────────────────
@@ -96,7 +159,7 @@ class RequestMetricSnapshot:
 
 @dataclass
 class CompressionMetrics:
-    """Aggregate metrics across requests."""
+    """Aggregate metrics across requests, with per-request tracking."""
 
     # ── Compression stats ──
     total_requests: int = 0
@@ -106,25 +169,35 @@ class CompressionMetrics:
     # ── CPU cache stats ──
     cpu_cache_hits: int = 0
     cpu_cache_misses: int = 0
-    cpu_total_match_tokens: int = 0  # sum of match_len across hits
-    cpu_total_entry_tokens: int = 0  # sum of entry_len across hits (for partial-match ratio)
+    cpu_total_match_tokens: int = 0
+    cpu_total_entry_tokens: int = 0
 
-    # ── Timing accumulators (ms) ──
+    # ── Timing accumulators (ms) — global ──
     total_prefill_ms: float = 0.0
     total_cpu_transfer_ms: float = 0.0
     total_compress_ms: float = 0.0
     total_decode_ms: float = 0.0
     decode_steps: int = 0
 
-    # ── Per-request history (last N for debugging) ──
-    _history: List[RequestMetricSnapshot] = field(default_factory=list)
-    _max_history: int = 128
+    # ── Active per-request trackers (req_id → RequestMetrics) ──
+    _active: Dict[int, RequestMetrics] = field(default_factory=dict)
+
+    # ── Completed request history (last N for debugging) ──
+    _history: List[RequestMetrics] = field(default_factory=list)
+    _max_history: int = 256
 
     # ── Logging control ──
-    _log_interval: int = 10  # log summary every N requests
+    _log_interval: int = 10
     _enabled: bool = True
 
-    # ─── Recording methods ────────────────────────────────────────────────
+    # ─── Internal: get or create active request ──────────────────────────
+
+    def _get_active(self, req_id: int) -> RequestMetrics:
+        if req_id not in self._active:
+            self._active[req_id] = RequestMetrics(req_id=req_id)
+        return self._active[req_id]
+
+    # ─── Recording methods (prefill phase) ───────────────────────────────
 
     def log_compression(
         self, req_id: int, original_len: int, compressed_len: int
@@ -135,12 +208,9 @@ class CompressionMetrics:
         self.total_original_tokens += original_len
         self.total_compressed_tokens += compressed_len
 
-        snap = self._get_or_create(req_id)
-        snap.original_len = original_len
-        snap.compressed_len = compressed_len
-
-        if self.total_requests % self._log_interval == 0:
-            self._log_summary()
+        rm = self._get_active(req_id)
+        rm.original_len = original_len
+        rm.compressed_len = compressed_len
 
     def log_cpu_cache_hit(
         self, req_id: int, match_len: int, entry_len: int
@@ -151,50 +221,131 @@ class CompressionMetrics:
         self.cpu_total_match_tokens += match_len
         self.cpu_total_entry_tokens += entry_len
 
-        snap = self._get_or_create(req_id)
-        snap.cpu_cache_hit = True
-        snap.cpu_match_len = match_len
-        snap.cpu_entry_len = entry_len
+        rm = self._get_active(req_id)
+        rm.cpu_cache_hit = True
+        rm.cpu_match_len = match_len
+        rm.cpu_entry_len = entry_len
 
     def log_cpu_cache_miss(self, req_id: int) -> None:
         if not self._enabled:
             return
         self.cpu_cache_misses += 1
-
-        snap = self._get_or_create(req_id)
-        snap.cpu_cache_hit = False
+        self._get_active(req_id).cpu_cache_hit = False
 
     def log_prefill_time(self, req_id: int, ms: float) -> None:
         if not self._enabled:
             return
         self.total_prefill_ms += ms
-        snap = self._get_or_create(req_id)
-        snap.prefill_ms = ms
+        self._get_active(req_id).prefill_ms = ms
 
     def log_cpu_transfer_time(self, req_id: int, ms: float) -> None:
         if not self._enabled:
             return
         self.total_cpu_transfer_ms += ms
-        snap = self._get_or_create(req_id)
-        snap.cpu_transfer_ms += ms
+        self._get_active(req_id).cpu_transfer_ms += ms
 
     def log_compress_time(self, req_id: int, ms: float) -> None:
         if not self._enabled:
             return
         self.total_compress_ms += ms
-        snap = self._get_or_create(req_id)
-        snap.compress_ms += ms
+        self._get_active(req_id).compress_ms += ms
 
+    # ─── Recording methods (decode phase) ────────────────────────────────
+
+    def log_decode_step(self, req_ids: List[int], batch_ms: float) -> None:
+        """Record one decode step for a batch of requests.
+
+        The batch decode time is split equally among requests.
+        Also updates global accumulators.
+        """
+        if not self._enabled:
+            return
+        self.total_decode_ms += batch_ms
+        self.decode_steps += 1
+
+        if not req_ids:
+            return
+        per_req_ms = batch_ms / len(req_ids)
+        for rid in req_ids:
+            rm = self._get_active(rid)
+            rm.decode_total_ms += per_req_ms
+            rm.decode_steps += 1
+
+    # Backward-compatible: global-only decode time (no per-request)
     def log_decode_time(self, ms: float) -> None:
         if not self._enabled:
             return
         self.total_decode_ms += ms
         self.decode_steps += 1
 
-    # ─── Reporting ────────────────────────────────────────────────────────
+    # ─── Per-request finalization ─────────────────────────────────────────
+
+    def finalize_request(self, req_id: int) -> None:
+        """Log per-request summary and move from active to history."""
+        rm = self._active.pop(req_id, None)
+        if rm is None:
+            return
+
+        # Save to history
+        self._history.append(rm)
+        if len(self._history) > self._max_history:
+            self._history.pop(0)
+
+        # Per-request log
+        ratio = (
+            rm.compressed_len / rm.original_len * 100
+            if rm.original_len > 0 else 0.0
+        )
+        parts = [
+            f"[KV Req#{rm.req_id}]",
+            f"seq={rm.original_len}→{rm.compressed_len} ({ratio:.0f}%)",
+        ]
+        if rm.cpu_cache_hit:
+            parts.append(f"cpu_hit={rm.cpu_match_len}tok")
+        if rm.cpu_transfer_ms > 0:
+            parts.append(f"transfer={rm.cpu_transfer_ms:.1f}ms")
+        parts.append(f"prefill={rm.prefill_ms:.1f}ms")
+        parts.append(f"compress={rm.compress_ms:.1f}ms")
+        if rm.decode_steps > 0:
+            avg_decode = rm.decode_total_ms / rm.decode_steps
+            parts.append(
+                f"decode={rm.decode_total_ms:.1f}ms "
+                f"({rm.decode_steps}steps, {avg_decode:.2f}ms/tok)"
+            )
+        total = rm.prefill_ms + rm.compress_ms + rm.cpu_transfer_ms + rm.decode_total_ms
+        parts.append(f"total={total:.1f}ms")
+        logger.info(" | ".join(parts))
+
+    # ─── Global summary reporting ─────────────────────────────────────────
+
+    def log_global_summary(self) -> None:
+        """Log one-line global average summary (called from backend)."""
+        if not self._enabled or self.total_requests == 0:
+            return
+        avg_ratio = (
+            self.total_compressed_tokens / self.total_original_tokens
+            if self.total_original_tokens > 0 else 0.0
+        )
+        total_lookups = self.cpu_cache_hits + self.cpu_cache_misses
+        hit_rate = self.cpu_cache_hits / total_lookups if total_lookups > 0 else 0.0
+
+        _msg = (
+            f"[KV Compress Global] reqs: {self.total_requests}, "
+            f"avg ratio: {avg_ratio:.1%} kept, "
+            f"cpu cache hit: {self.cpu_cache_hits}/{total_lookups} ({hit_rate:.0%})"
+        )
+        if self.cpu_cache_hits > 0:
+            _msg += f", avg match: {self.cpu_total_match_tokens / self.cpu_cache_hits:.0f} tokens"
+            _msg += f", avg transfer: {self.total_cpu_transfer_ms / self.cpu_cache_hits:.1f}ms"
+        if self.total_requests > 0:
+            _msg += f", avg prefill: {self.total_prefill_ms / self.total_requests:.1f}ms"
+            _msg += f", avg compress: {self.total_compress_ms / self.total_requests:.1f}ms"
+        if self.decode_steps > 0:
+            _msg += f", avg decode: {self.total_decode_ms / self.decode_steps:.2f}ms/tok"
+        logger.info(_msg)
 
     def report(self) -> str:
-        """Build a human-readable summary string and log it."""
+        """Build a human-readable detailed summary string and log it."""
         lines = ["=" * 60, "KV Compression Metrics Summary", "=" * 60]
 
         # Compression
@@ -253,41 +404,12 @@ class CompressionMetrics:
         self.total_compress_ms = 0.0
         self.total_decode_ms = 0.0
         self.decode_steps = 0
+        self._active.clear()
         self._history.clear()
 
-    def get_last_snapshot(self, req_id: int) -> Optional[RequestMetricSnapshot]:
-        for snap in reversed(self._history):
-            if snap.req_id == req_id:
-                return snap
-        return None
-
-    # ─── Internal ─────────────────────────────────────────────────────────
-
-    def _get_or_create(self, req_id: int) -> RequestMetricSnapshot:
-        for snap in reversed(self._history):
-            if snap.req_id == req_id:
-                return snap
-        snap = RequestMetricSnapshot(req_id=req_id)
-        self._history.append(snap)
-        if len(self._history) > self._max_history:
-            self._history.pop(0)
-        return snap
-
-    def _log_summary(self) -> None:
-        """Auto-log summary at intervals."""
-        if self.total_requests == 0:
-            return
-        avg_ratio = (
-            self.total_compressed_tokens / self.total_original_tokens
-            if self.total_original_tokens > 0
-            else 0.0
-        )
-        total_lookups = self.cpu_cache_hits + self.cpu_cache_misses
-        hit_rate = self.cpu_cache_hits / total_lookups if total_lookups > 0 else 0.0
-        logger.info(
-            f"[CompressionMetrics] reqs={self.total_requests} "
-            f"avg_ratio={avg_ratio:.2%} "
-            f"cpu_hit={hit_rate:.1%} "
-            f"prefill={self.total_prefill_ms / self.total_requests:.1f}ms "
-            f"compress={self.total_compress_ms / self.total_requests:.1f}ms"
-        )
+    def get_last_snapshot(self, req_id: int) -> Optional[RequestMetrics]:
+        for rm in reversed(self._history):
+            if rm.req_id == req_id:
+                return rm
+        # Also check active
+        return self._active.get(req_id)

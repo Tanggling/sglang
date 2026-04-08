@@ -260,6 +260,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             # Timers that accumulate across layers (sync only at last layer)
             forward_batch._timer_prefill = LayerAccumTimer()
             forward_batch._timer_compress = LayerAccumTimer()
+            forward_batch._timer_transfer = LayerAccumTimer()
 
             forward_batch._cpu_miss_set: set = set()
             _metrics = get_metrics()
@@ -356,13 +357,14 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
             # ── Load CPU prefix KV into GlobalKVPool ──────────────────────
             if _prefix_len > 0:
-                
+                forward_batch._timer_transfer.mark_start()
                 _req = reqs[seq_idx]
                 _entry = _req.cpu_prefix_entry
                 _k_doc, _v_doc = self.cpu_prefix_cache.load_layer_to_gpu(
                     _entry, layer_id, str(device), num_tokens=_prefix_len
                 )
                 global_kv_pool.write_kv(global_slots[:_prefix_len], _k_doc, _v_doc)
+                forward_batch._timer_transfer.mark_end()
 
             # ── Write extend KV to GlobalKVPool ───────────────────────────
             if extend_len > 0:
@@ -538,34 +540,17 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         if layer_id == num_layers - 1:
             _prefill_total_ms = forward_batch._timer_prefill.sync_and_total()
             _compress_total_ms = forward_batch._timer_compress.sync_and_total()
+            _transfer_total_ms = forward_batch._timer_transfer.sync_and_total()
 
             _cm = get_metrics()
             for _si in range(batch_size):
                 _req_id = req_pool_indices[_si].item()
                 _cm.log_prefill_time(_req_id, _prefill_total_ms / max(batch_size, 1))
                 _cm.log_compress_time(_req_id, _compress_total_ms / max(batch_size, 1))
+                if _si in cpu_prefix_lens and cpu_prefix_lens[_si] > 0:
+                    _cm.log_cpu_transfer_time(_req_id, _transfer_total_ms / max(len(cpu_prefix_lens), 1))
 
-            if _cm.total_requests > 0:
-                _avg_ratio = (
-                    _cm.total_compressed_tokens / _cm.total_original_tokens
-                    if _cm.total_original_tokens > 0 else 0.0
-                )
-                _total_lookups = _cm.cpu_cache_hits + _cm.cpu_cache_misses
-                _hit_rate = _cm.cpu_cache_hits / _total_lookups if _total_lookups > 0 else 0.0
-                _msg = (
-                    f"[KV Compress] reqs: {_cm.total_requests}, "
-                    f"avg ratio: {_avg_ratio:.1%} kept, "
-                    f"cpu cache hit: {_cm.cpu_cache_hits}/{_total_lookups} ({_hit_rate:.0%})"
-                )
-                if _cm.cpu_cache_hits > 0:
-                    _msg += f", avg match: {_cm.cpu_total_match_tokens / _cm.cpu_cache_hits:.0f} tokens"
-                    _msg += f", avg transfer: {_cm.total_cpu_transfer_ms / _cm.cpu_cache_hits:.1f}ms"
-                if _cm.total_requests > 0:
-                    _msg += f", avg prefill(all layers): {_cm.total_prefill_ms / _cm.total_requests:.1f}ms"
-                    _msg += f", avg compress(all layers): {_cm.total_compress_ms / _cm.total_requests:.1f}ms"
-                if _cm.decode_steps > 0:
-                    _msg += f", avg decode(all layers): {_cm.total_decode_ms / _cm.decode_steps:.2f}ms/token"
-                logger.info(_msg)
+            _cm.log_global_summary()
 
         return output
 
@@ -1627,7 +1612,8 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             )
         # Only record at layer 0 to avoid over-counting
         if layer_id == 0:
-            get_metrics().log_decode_time(_t_decode.elapsed_ms)
+            req_ids = forward_batch.req_pool_indices.tolist()
+            get_metrics().log_decode_step(req_ids, _t_decode.elapsed_ms)
         return result
 
     # ================================================================== #

@@ -493,6 +493,11 @@ class SchedulerOutputProcessorMixin:
 
                 req.time_stats.completion_time = time.perf_counter()
 
+                # Log per-request KV compression metrics
+                if self.server_args.kv_compression_ratio > 0.0:
+                    from sglang.srt.layers.attention.compression_metrics import get_metrics
+                    get_metrics().finalize_request(req.req_pool_idx)
+
             self.maybe_collect_customized_info(i, req, logits_output)
 
             if req.return_logprob and batch.spec_algorithm.is_none():
