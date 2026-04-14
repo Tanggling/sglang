@@ -284,9 +284,19 @@ class TpModelWorker(BaseTpWorker):
         assert (
             self.max_queued_requests is None or self.max_queued_requests >= 1
         ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
+        # When KV compression is enabled, a request of length S only occupies
+        # S * (1 - compression_ratio) real pool slots, so the effective capacity
+        # of the pool (in terms of original input length) is larger.
+        compression_ratio = server_args.kv_compression_ratio
+        if compression_ratio > 0.0:
+            effective_pool_size = int(
+                self.model_runner.max_token_pool_size / (1 - compression_ratio)
+            )
+        else:
+            effective_pool_size = self.model_runner.max_token_pool_size
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.max_token_pool_size - 1,
+            effective_pool_size - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert (

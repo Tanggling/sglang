@@ -2444,9 +2444,7 @@ class ModelWorkerBatch:
     extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
     extend_input_logprob_token_ids: Optional[torch.Tensor]
-    
-    # For KV compression: compressed total length for each request
-    compressed_total_lens_cpu: Optional[List[int]] = None
+
 
     # For multimodal
     multimodal_inputs: Optional[List[MultimodalInputs]]
@@ -2463,6 +2461,10 @@ class ModelWorkerBatch:
     # Sampling info
     sampling_info: SamplingBatchInfo
 
+    
+    # For KV compression: compressed total length for each request
+    compressed_total_lens_cpu: Optional[List[int]] = None
+    
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: Optional[torch.Tensor] = None
 

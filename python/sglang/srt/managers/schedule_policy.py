@@ -384,6 +384,7 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
+        kv_compression_ratio: float = 0.0,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -393,6 +394,9 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
+        # When KV compression is enabled, a request only occupies (1-r) fraction
+        # of real pool slots compared to its original token count.
+        self.kv_compression_ratio = kv_compression_ratio
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -513,7 +517,9 @@ class PrefillAdder:
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
-        self.rem_total_token_offset += extend_input_len + max_new_tokens
+        # rem_total_token_offset tracks how many real pool slots will be consumed.
+        # With compression, only (1-r) fraction is actually stored in real pool.
+        pool_tokens = extend_input_len + max_new_tokens
         self.cur_rem_token_offset += extend_input_len
         self.rem_input_tokens -= extend_input_len
 
@@ -735,6 +741,10 @@ class PrefillAdder:
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
+        # When KV compression is enabled, the real pool only stores compressed KV,
+        # so the actual pool slot consumption is reduced by (1 - compression_ratio).
+        if self.kv_compression_ratio > 0.0:
+            total_tokens = int(total_tokens * (1 - self.kv_compression_ratio))
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length

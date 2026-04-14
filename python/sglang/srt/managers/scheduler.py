@@ -2042,6 +2042,7 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            kv_compression_ratio=self.server_args.kv_compression_ratio,
         )
 
         if self.chunked_req is not None:

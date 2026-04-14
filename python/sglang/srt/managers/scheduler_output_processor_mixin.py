@@ -484,6 +484,11 @@ class SchedulerOutputProcessorMixin:
             if req.finished():
                 self.maybe_collect_routed_experts(req)
 
+                # Save req_pool_idx before release_kv_cache clears it
+                _saved_pool_idx = req.req_pool_idx
+                if hasattr(_saved_pool_idx, "item"):
+                    _saved_pool_idx = _saved_pool_idx.item()
+
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
@@ -494,9 +499,9 @@ class SchedulerOutputProcessorMixin:
                 req.time_stats.completion_time = time.perf_counter()
 
                 # Log per-request KV compression metrics
-                if self.server_args.kv_compression_ratio > 0.0:
+                if self.server_args.kv_compression_ratio > 0.0 and _saved_pool_idx is not None:
                     from sglang.srt.layers.attention.compression_metrics import get_metrics
-                    get_metrics().finalize_request(req.req_pool_idx)
+                    get_metrics().finalize_request(_saved_pool_idx)
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
