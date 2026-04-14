@@ -284,6 +284,7 @@ class CompressionMetrics:
         """Log per-request summary and move from active to history."""
         rm = self._active.pop(req_id, None)
         if rm is None:
+            print(f"Warning: finalize_request called for unknown req_id {req_id}")
             return
 
         # Save to history
