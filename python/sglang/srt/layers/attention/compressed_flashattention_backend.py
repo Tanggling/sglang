@@ -260,6 +260,8 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             # Timers that accumulate across layers (sync only at last layer)
             forward_batch._timer_prefill = LayerAccumTimer()
             forward_batch._timer_compress = LayerAccumTimer()
+            forward_batch._timer_compress_algo = LayerAccumTimer()
+            forward_batch._timer_kv_write = LayerAccumTimer()
             forward_batch._timer_transfer = LayerAccumTimer()
 
             forward_batch._cpu_miss_set: set = set()
@@ -453,6 +455,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 q_for_compress = q_view[q_start:q_end]
 
             # ── Compress: select important tokens from the full sequence ──
+            forward_batch._timer_compress_algo.mark_start()
             _, _, keep_indices = self._estimate_importance(
                 method=self.importance_method,
                 q=q_for_compress,
@@ -463,6 +466,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 head_dim=head_dim,
                 scaling=layer.scaling,
             )
+            forward_batch._timer_compress_algo.mark_end()
 
             is_per_head = keep_indices is not None and keep_indices.dim() == 2
             if keep_indices is None:
@@ -499,6 +503,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 num_to_keep = real_slots.shape[0]
 
             # ── Write compressed KV to real pool slots ───────────────────
+            forward_batch._timer_kv_write.mark_start()
             self._write_compressed_to_real(
                 layer_id=layer_id,
                 k_seq=k_full,
@@ -512,6 +517,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
             # ── Free GlobalKVPool slots immediately (reuse for next layer) ─
             global_kv_pool.free(global_slots)
+            forward_batch._timer_kv_write.mark_end()
 
         _timer_compress.mark_end()
 
@@ -541,14 +547,18 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             _prefill_total_ms = forward_batch._timer_prefill.sync_and_total()
             _compress_total_ms = forward_batch._timer_compress.sync_and_total()
             _transfer_total_ms = forward_batch._timer_transfer.sync_and_total()
+            _compress_algo_total_ms = forward_batch._timer_compress_algo.sync_and_total()
+            _kv_write_total_ms = forward_batch._timer_kv_write.sync_and_total()
 
             _cm = get_metrics()
             for _si in range(batch_size):
                 _req_id = req_pool_indices[_si].item()
                 _cm.log_prefill_time(_req_id, _prefill_total_ms / max(batch_size, 1))
                 _cm.log_compress_time(_req_id, _compress_total_ms / max(batch_size, 1))
+                _cm.log_compress_algo_time(_req_id, _compress_algo_total_ms / max(batch_size, 1))
                 if _si in cpu_prefix_lens and cpu_prefix_lens[_si] > 0:
                     _cm.log_cpu_transfer_time(_req_id, _transfer_total_ms / max(len(cpu_prefix_lens), 1))
+                _cm.log_kv_write_time(_req_id, _kv_write_total_ms / max(batch_size, 1))
 
             _cm.log_global_summary()
 

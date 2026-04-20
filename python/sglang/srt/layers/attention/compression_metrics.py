@@ -148,6 +148,8 @@ class RequestMetrics:
     prefill_ms: float = 0.0
     cpu_transfer_ms: float = 0.0
     compress_ms: float = 0.0
+    compress_algo_ms: float = 0.0   # pure compression algorithm time
+    kv_write_ms: float = 0.0        # KV write to real pool + GlobalKVPool free time
 
     # Decode timing — accumulated across all decode steps
     decode_total_ms: float = 0.0
@@ -176,6 +178,8 @@ class CompressionMetrics:
     total_prefill_ms: float = 0.0
     total_cpu_transfer_ms: float = 0.0
     total_compress_ms: float = 0.0
+    total_compress_algo_ms: float = 0.0   # pure compression algorithm time
+    total_kv_write_ms: float = 0.0        # KV write to real pool + GlobalKVPool free
     total_decode_ms: float = 0.0
     decode_steps: int = 0
 
@@ -250,6 +254,18 @@ class CompressionMetrics:
         self.total_compress_ms += ms
         self._get_active(req_id).compress_ms += ms
 
+    def log_compress_algo_time(self, req_id: int, ms: float) -> None:
+        if not self._enabled:
+            return
+        self.total_compress_algo_ms += ms
+        self._get_active(req_id).compress_algo_ms += ms
+
+    def log_kv_write_time(self, req_id: int, ms: float) -> None:
+        if not self._enabled:
+            return
+        self.total_kv_write_ms += ms
+        self._get_active(req_id).kv_write_ms += ms
+
     # ─── Recording methods (decode phase) ────────────────────────────────
 
     def log_decode_step(self, req_ids: List[int], batch_ms: float) -> None:
@@ -307,6 +323,8 @@ class CompressionMetrics:
             parts.append(f"transfer={rm.cpu_transfer_ms:.1f}ms")
         parts.append(f"prefill={rm.prefill_ms:.1f}ms")
         parts.append(f"compress={rm.compress_ms:.1f}ms")
+        parts.append(f"compress_algo={rm.compress_algo_ms:.1f}ms")
+        parts.append(f"kv_write={rm.kv_write_ms:.1f}ms")
         if rm.decode_steps > 0:
             avg_decode = rm.decode_total_ms / rm.decode_steps
             parts.append(
@@ -341,6 +359,8 @@ class CompressionMetrics:
         if self.total_requests > 0:
             _msg += f", avg prefill: {self.total_prefill_ms / self.total_requests:.1f}ms"
             _msg += f", avg compress: {self.total_compress_ms / self.total_requests:.1f}ms"
+            _msg += f", avg compress_algo: {self.total_compress_algo_ms / self.total_requests:.1f}ms"
+            _msg += f", avg kv_write: {self.total_kv_write_ms / self.total_requests:.1f}ms"
         if self.decode_steps > 0:
             _msg += f", avg decode: {self.total_decode_ms / self.decode_steps:.2f}ms/tok"
         logger.info(_msg)
@@ -382,6 +402,8 @@ class CompressionMetrics:
             if self.total_requests > 0:
                 lines.append(f"    Avg prefill:       {self.total_prefill_ms / self.total_requests:.1f} ms/req")
                 lines.append(f"    Avg compression:   {self.total_compress_ms / self.total_requests:.1f} ms/req")
+                lines.append(f"    Avg compress_algo: {self.total_compress_algo_ms / self.total_requests:.1f} ms/req")
+                lines.append(f"    Avg kv_write:      {self.total_kv_write_ms / self.total_requests:.1f} ms/req")
             if self.cpu_cache_hits > 0:
                 lines.append(f"    Avg CPU transfer:  {self.total_cpu_transfer_ms / self.cpu_cache_hits:.1f} ms/hit")
             if self.decode_steps > 0:
@@ -403,6 +425,8 @@ class CompressionMetrics:
         self.total_prefill_ms = 0.0
         self.total_cpu_transfer_ms = 0.0
         self.total_compress_ms = 0.0
+        self.total_compress_algo_ms = 0.0
+        self.total_kv_write_ms = 0.0
         self.total_decode_ms = 0.0
         self.decode_steps = 0
         self._active.clear()

@@ -379,8 +379,8 @@ class SnapKVStyleCompressor(BaseKVCompressor):
                     
                     attn_weights_full = torch.cat([attn_weights, attn_weights_window], dim=-1)
                     
-                    attention_scores = F.softmax(attn_weights_full, dim=-1, dtype=torch.float32).to(query.dtype)
-                    
+                    # attention_scores = F.softmax(attn_weights_full, dim=-1, dtype=torch.float32).to(query.dtype)
+                    attention_scores = attn_weights_full
                     attn_weights_prefix = attention_scores[:, :, :k_prefix.shape[0]]
                 else:
                     attention_scores = F.softmax(attn_weights, dim=-1)

@@ -1,5 +1,5 @@
 python -m sglang.launch_server \
-    --model-path ../../../autodl-tmp/LWM-1M/ \
+    --model-path ../../../autodl-tmp/Mistral/ \
     --port 30000 \
     --disable-cuda-graph \
     --mem-fraction-static 0.8 \
@@ -9,4 +9,4 @@ python -m sglang.launch_server \
     --chunked-prefill-size -1 \
     --max-prefill-tokens 120000 \
     --attention-backend compressed_fa3 \
-    --kv-compression-ratio 0.9
+    --kv-compression-ratio 0.5
