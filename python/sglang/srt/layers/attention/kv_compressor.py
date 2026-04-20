@@ -352,29 +352,38 @@ class SnapKVStyleCompressor(BaseKVCompressor):
             if k_prefix.shape[0] == 0:
                 keep_indices = torch.arange(seq_len, device=k.device).unsqueeze(0).expand(num_kv_heads, -1)
             else:
+                # q_t: [num_heads, window_size, head_dim]
                 q_t = q_window.transpose(0, 1).contiguous()
+                # k_t: [num_kv_heads, prefix_len, head_dim]
                 k_t = k_prefix.transpose(0, 1).contiguous()
                 
-                if kv_group_num > 1:
-                    k_t = k_t.repeat_interleave(kv_group_num, dim=0)
-                    
-                attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
+                # Optimized GQA: reshape Q instead of expanding K
+                # q_t: [num_heads, window, dim] → [kv_heads, group*window, dim]
+                # Then bmm with k_t: [kv_heads, prefix_len, dim]
+                # Result: [kv_heads, group*window, prefix_len] → sum → [kv_heads, prefix_len]
+                q_grouped = q_t.view(num_kv_heads, kv_group_num * window_size, q_head_dim)
+                attn_weights = torch.bmm(q_grouped, k_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
+                # attn_weights: [kv_heads, group*window, prefix_len]
                 torch.cuda.current_stream().synchronize()
 
                 if self.apply_causal_mask:
                     k_window = k[-window_size:]
+                    # k_window_t: [num_kv_heads, window_size, head_dim]
                     k_window_t = k_window.transpose(0, 1).contiguous()
-                    if kv_group_num > 1:
-                        k_window_t = k_window_t.repeat_interleave(kv_group_num, dim=0)
                     
-                    attn_weights_window = torch.matmul(q_t, k_window_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
+                    # Same optimization for window attention
+                    attn_weights_window = torch.bmm(q_grouped, k_window_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
 
                     q_window_len = q_window.shape[0]
                     k_window_len = k_window.shape[0]
-                    causal_mask = torch.triu(
+                    # Causal mask for [q_window_len, k_window_len], then tile for groups
+                    causal_mask_base = torch.triu(
                         torch.full((q_window_len, k_window_len), float('-inf'), device=k.device, dtype=attn_weights_window.dtype),
                         diagonal=1 + k_window_len - q_window_len
                     )
+                    # attn_weights_window: [kv_heads, group*window, k_window_len]
+                    # causal_mask needs shape [group*window, k_window_len] — tile the mask for each group
+                    causal_mask = causal_mask_base.repeat(kv_group_num, 1)  # [group*window, k_window_len]
                     attn_weights_window = attn_weights_window + causal_mask.unsqueeze(0)
                     
                     attn_weights_full = torch.cat([attn_weights, attn_weights_window], dim=-1)
@@ -386,13 +395,9 @@ class SnapKVStyleCompressor(BaseKVCompressor):
                     attention_scores = F.softmax(attn_weights, dim=-1)
                     attn_weights_prefix = attention_scores
                 
+                # attn_weights_prefix: [kv_heads, group*window, prefix_len]
+                # Sum over group*window dimension → [kv_heads, prefix_len]
                 attn_weights_sum = attn_weights_prefix.sum(dim=1)
-                
-                if kv_group_num > 1:
-                    attn_weights_sum = attn_weights_sum.view(num_kv_heads, kv_group_num, -1)
-                    attn_weights_sum = attn_weights_sum.sum(dim=1)
-                else:
-                    attn_weights_sum = attn_weights_sum.view(num_kv_heads, -1)
                 
                 if attn_weights_sum.shape[-1] > self.kernel_size:
                     if self.pooling == 'maxpool':

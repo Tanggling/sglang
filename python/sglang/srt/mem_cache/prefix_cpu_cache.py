@@ -30,12 +30,16 @@ Design Philosophy:
 """
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# Environment variable switch: set USE_PINNED_MEMORY=0 to disable pinned memory (for A/B testing)
+_USE_PINNED_MEMORY = os.environ.get("USE_PINNED_MEMORY", "1") != "0"
 
 # ------------------------------------------------------------------ #
 # Global registry – mirrors the get_global_server_args() pattern so  #
@@ -170,10 +174,20 @@ class PrefixCPUCache:
             )
             return
 
-        # Non-blocking transfer to CPU (overlaps with GPU compute)
-        k_cpu = k.detach().to("cpu", non_blocking=True)
-        v_cpu = v.detach().to("cpu", non_blocking=True)
-        q_cpu = q.detach().to("cpu", non_blocking=True)
+        if _USE_PINNED_MEMORY:
+            # Transfer to pinned CPU memory for faster future GPU transfers.
+            # Pinned memory enables DMA-based CPU→GPU transfer (~22 GB/s vs ~11 GB/s pageable).
+            k_cpu = torch.empty(k.shape, dtype=k.dtype, device="cpu", pin_memory=True)
+            v_cpu = torch.empty(v.shape, dtype=v.dtype, device="cpu", pin_memory=True)
+            q_cpu = torch.empty(q.shape, dtype=q.dtype, device="cpu", pin_memory=True)
+            k_cpu.copy_(k, non_blocking=True)
+            v_cpu.copy_(v, non_blocking=True)
+            q_cpu.copy_(q, non_blocking=True)
+        else:
+            # Pageable memory (baseline): extra memcpy through staging buffer on transfer
+            k_cpu = k.detach().to("cpu", non_blocking=True)
+            v_cpu = v.detach().to("cpu", non_blocking=True)
+            q_cpu = q.detach().to("cpu", non_blocking=True)
         self._pending[request_id][layer_id] = (k_cpu, v_cpu, q_cpu)
 
     def finalize_entry(self, request_id: int, token_ids) -> Optional[int]:
@@ -372,8 +386,9 @@ class PrefixCPUCache:
         if num_tokens is not None and num_tokens < k_cpu.shape[0]:
             k_cpu = k_cpu[:num_tokens]
             v_cpu = v_cpu[:num_tokens]
-        k_gpu = k_cpu.to(device, non_blocking=False)
-        v_gpu = v_cpu.to(device, non_blocking=False)
+        # Use non_blocking=True since source tensors are in pinned memory
+        k_gpu = k_cpu.to(device, non_blocking=True)
+        v_gpu = v_cpu.to(device, non_blocking=True)
         return k_gpu, v_gpu
 
     def load_query_to_gpu(
