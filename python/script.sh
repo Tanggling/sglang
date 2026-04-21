@@ -1,12 +1,13 @@
-python -m sglang.launch_server \
-    --model-path ../../../autodl-tmp/Qwen2.5-7B-Instruct/ \
+_USE_PINNED_MEMORY=1 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 python -m sglang.launch_server \
+    --model-path ../../../autodl-tmp/Mistral/ \
     --port 30000 \
     --disable-cuda-graph \
-    --mem-fraction-static 0.8 \
+    --mem-fraction-static 0.7 \
     --disable-radix-cache \
     --disable-context-len-check \
     --page-size 1 \
     --chunked-prefill-size -1 \
-    --max-prefill-tokens 120000 \
+    --max-prefill-tokens 138000 \
+    --context-length 138000 \
     --attention-backend compressed_fa3 \
     --kv-compression-ratio 0.9

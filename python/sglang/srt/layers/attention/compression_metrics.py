@@ -150,6 +150,7 @@ class RequestMetrics:
     compress_ms: float = 0.0
     compress_algo_ms: float = 0.0   # pure compression algorithm time
     kv_write_ms: float = 0.0        # KV write to real pool + GlobalKVPool free time
+    finalize_ms: float = 0.0        # CPU prefix cache finalize (includes cuda sync)
 
     # Decode timing — accumulated across all decode steps
     decode_total_ms: float = 0.0
@@ -180,6 +181,7 @@ class CompressionMetrics:
     total_compress_ms: float = 0.0
     total_compress_algo_ms: float = 0.0   # pure compression algorithm time
     total_kv_write_ms: float = 0.0        # KV write to real pool + GlobalKVPool free
+    total_finalize_ms: float = 0.0        # CPU prefix cache finalize
     total_decode_ms: float = 0.0
     decode_steps: int = 0
 
@@ -266,9 +268,15 @@ class CompressionMetrics:
         self.total_kv_write_ms += ms
         self._get_active(req_id).kv_write_ms += ms
 
+    def log_finalize_time(self, req_id: int, ms: float) -> None:
+        if not self._enabled:
+            return
+        self.total_finalize_ms += ms
+        self._get_active(req_id).finalize_ms += ms
+
     # ─── Recording methods (decode phase) ────────────────────────────────
 
-    def log_decode_step(self, req_ids: List[int], batch_ms: float) -> None:
+    def log_decode_step(self, req_ids: List[int], batch_ms: float, add_step: bool = True) -> None:
         """Record one decode step for a batch of requests.
 
         The batch decode time is split equally among requests.
@@ -277,7 +285,7 @@ class CompressionMetrics:
         if not self._enabled:
             return
         self.total_decode_ms += batch_ms
-        self.decode_steps += 1
+        self.decode_steps += 1 if add_step else 0
 
         if not req_ids:
             return
@@ -285,7 +293,7 @@ class CompressionMetrics:
         for rid in req_ids:
             rm = self._get_active(rid)
             rm.decode_total_ms += per_req_ms
-            rm.decode_steps += 1
+            rm.decode_steps += 1 if add_step else 0
 
     # Backward-compatible: global-only decode time (no per-request)
     def log_decode_time(self, ms: float) -> None:
@@ -325,13 +333,15 @@ class CompressionMetrics:
         parts.append(f"compress={rm.compress_ms:.1f}ms")
         parts.append(f"compress_algo={rm.compress_algo_ms:.1f}ms")
         parts.append(f"kv_write={rm.kv_write_ms:.1f}ms")
+        if rm.finalize_ms > 0:
+            parts.append(f"finalize={rm.finalize_ms:.1f}ms")
         if rm.decode_steps > 0:
             avg_decode = rm.decode_total_ms / rm.decode_steps
             parts.append(
                 f"decode={rm.decode_total_ms:.1f}ms "
                 f"({rm.decode_steps}steps, {avg_decode:.2f}ms/tok)"
             )
-        total = rm.prefill_ms + rm.compress_ms + rm.cpu_transfer_ms + rm.decode_total_ms
+        total = rm.prefill_ms + rm.compress_ms + rm.cpu_transfer_ms + rm.finalize_ms + rm.decode_total_ms
         parts.append(f"total={total:.1f}ms")
         logger.info(" | ".join(parts))
 
@@ -361,6 +371,8 @@ class CompressionMetrics:
             _msg += f", avg compress: {self.total_compress_ms / self.total_requests:.1f}ms"
             _msg += f", avg compress_algo: {self.total_compress_algo_ms / self.total_requests:.1f}ms"
             _msg += f", avg kv_write: {self.total_kv_write_ms / self.total_requests:.1f}ms"
+            if self.total_finalize_ms > 0:
+                _msg += f", avg finalize: {self.total_finalize_ms / self.total_requests:.1f}ms"
         if self.decode_steps > 0:
             _msg += f", avg decode: {self.total_decode_ms / self.decode_steps:.2f}ms/tok"
         logger.info(_msg)
@@ -404,6 +416,8 @@ class CompressionMetrics:
                 lines.append(f"    Avg compression:   {self.total_compress_ms / self.total_requests:.1f} ms/req")
                 lines.append(f"    Avg compress_algo: {self.total_compress_algo_ms / self.total_requests:.1f} ms/req")
                 lines.append(f"    Avg kv_write:      {self.total_kv_write_ms / self.total_requests:.1f} ms/req")
+                if self.total_finalize_ms > 0:
+                    lines.append(f"    Avg finalize:      {self.total_finalize_ms / self.total_requests:.1f} ms/req")
             if self.cpu_cache_hits > 0:
                 lines.append(f"    Avg CPU transfer:  {self.total_cpu_transfer_ms / self.cpu_cache_hits:.1f} ms/hit")
             if self.decode_steps > 0:
@@ -427,6 +441,7 @@ class CompressionMetrics:
         self.total_compress_ms = 0.0
         self.total_compress_algo_ms = 0.0
         self.total_kv_write_ms = 0.0
+        self.total_finalize_ms = 0.0
         self.total_decode_ms = 0.0
         self.decode_steps = 0
         self._active.clear()

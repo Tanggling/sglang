@@ -386,10 +386,19 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
 
             # Save full KQV to CPU for miss sequences
             if do_cpu and seq_idx in cpu_miss_set:
+                import time as _time
+                _finalize_start = _time.perf_counter()
+                
                 q_seq_for_save = q_view[q_start:q_end]
                 self.cpu_prefix_cache.accumulate_layer_kqv(
                     req_id, layer_id, k_full, v_full, q_seq_for_save
                 )
+
+                _finalize_ms = (_time.perf_counter() - _finalize_start) * 1000.0
+                _cm_fin = get_metrics()
+                for _si in cpu_miss_set:
+                    _req_id = req_pool_indices[_si].item()
+                    _cm_fin.log_finalize_time(_req_id, _finalize_ms)
 
             seq_data.append((k_full, v_full, full_seq_len, global_slots, real_slots_seq))
 
@@ -529,6 +538,8 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 self.token_to_kv_pool_allocator.free(torch.cat(slots_to_free))
 
             if do_cpu and cpu_miss_set:
+                # import time as _time
+                # _finalize_start = _time.perf_counter()
                 _input_ids_list = forward_batch.input_ids.cpu().tolist()
                 for _si in cpu_miss_set:
                     _qs = cu_seqlens_q[_si].item()
@@ -536,6 +547,11 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                     _toks = _input_ids_list[_qs:_qe]
                     _req_id = req_pool_indices[_si].item()
                     self.cpu_prefix_cache.finalize_entry(_req_id, _toks)
+                # _finalize_ms = (_time.perf_counter() - _finalize_start) * 1000.0
+                # _cm_fin = get_metrics()
+                # for _si in cpu_miss_set:
+                #     _req_id = req_pool_indices[_si].item()
+                #     _cm_fin.log_finalize_time(_req_id, _finalize_ms / max(len(cpu_miss_set), 1))
 
         forward_batch._gr_compressed_lens = all_compressed_lens
         forward_batch.kv_compressed_lens = [
@@ -788,6 +804,8 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 self.token_to_kv_pool_allocator.free(torch.cat(slots_to_free))
 
             if do_cpu and cpu_miss_set:
+                import time as _time
+                _finalize_start = _time.perf_counter()
                 _input_ids_list = forward_batch.input_ids.cpu().tolist()
                 for _si in cpu_miss_set:
                     _qs = cu_seqlens_q[_si].item()
@@ -795,6 +813,11 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                     _toks = _input_ids_list[_qs:_qe]
                     _req_id = req_pool_indices[_si].item()
                     self.cpu_prefix_cache.finalize_entry(_req_id, _toks)
+                _finalize_ms = (_time.perf_counter() - _finalize_start) * 1000.0
+                _cm_fin = get_metrics()
+                for _si in cpu_miss_set:
+                    _req_id = req_pool_indices[_si].item()
+                    _cm_fin.log_finalize_time(_req_id, _finalize_ms / max(len(cpu_miss_set), 1))
 
         forward_batch._gr_compressed_lens = all_compressed_lens
         forward_batch.kv_compressed_lens = [
@@ -1621,9 +1644,10 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
         # Only record at layer 0 to avoid over-counting
-        if layer_id == 0:
-            req_ids = forward_batch.req_pool_indices.tolist()
-            get_metrics().log_decode_step(req_ids, _t_decode.elapsed_ms)
+        # if layer_id == 0:
+        req_ids = forward_batch.req_pool_indices.tolist()
+        get_metrics().log_decode_step(req_ids, _t_decode.elapsed_ms, add_step=layer_id==0)
+
         return result
 
     # ================================================================== #

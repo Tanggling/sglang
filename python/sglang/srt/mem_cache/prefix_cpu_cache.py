@@ -175,8 +175,6 @@ class PrefixCPUCache:
             return
 
         if _USE_PINNED_MEMORY:
-            # Transfer to pinned CPU memory for faster future GPU transfers.
-            # Pinned memory enables DMA-based CPU→GPU transfer (~22 GB/s vs ~11 GB/s pageable).
             k_cpu = torch.empty(k.shape, dtype=k.dtype, device="cpu", pin_memory=True)
             v_cpu = torch.empty(v.shape, dtype=v.dtype, device="cpu", pin_memory=True)
             q_cpu = torch.empty(q.shape, dtype=q.dtype, device="cpu", pin_memory=True)
@@ -184,7 +182,6 @@ class PrefixCPUCache:
             v_cpu.copy_(v, non_blocking=True)
             q_cpu.copy_(q, non_blocking=True)
         else:
-            # Pageable memory (baseline): extra memcpy through staging buffer on transfer
             k_cpu = k.detach().to("cpu", non_blocking=True)
             v_cpu = v.detach().to("cpu", non_blocking=True)
             q_cpu = q.detach().to("cpu", non_blocking=True)
