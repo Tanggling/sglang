@@ -63,15 +63,16 @@ def get_global_cpu_prefix_cache() -> Optional["PrefixCPUCache"]:
 @dataclass
 class CPUKVEntry:
     """
-    CPU-side storage for full (uncompressed) KV **and Q** data of a prefix.
+    CPU-side storage for full (uncompressed) KV **and GQA-aggregated Q** data of a prefix.
 
     Fields:
         token_ids:  The prefix token IDs used as cache key (for collision detection)
         seq_len:    Number of prefix tokens
         kv_layers:  List of (k_cpu, v_cpu) per layer.
                     Each tensor shape: [seq_len, num_kv_heads, head_dim] on CPU
-        q_layers:   List of q_cpu per layer.
-                    Each tensor shape: [seq_len, num_heads, head_dim] on CPU.
+        q_layers:   List of q_agg_cpu per layer.
+                    Each tensor shape: [seq_len, num_kv_heads, head_dim] on CPU.
+                    This is the GQA-aggregated query (sum over group dimension).
                     Used to pad short queries during compression importance estimation.
         ref_count:  Number of active requests currently using this entry
     """
@@ -80,7 +81,7 @@ class CPUKVEntry:
     seq_len: int
     # kv_layers[layer_id] = (k_cpu_tensor, v_cpu_tensor)
     kv_layers: List[Tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
-    # q_layers[layer_id] = q_cpu_tensor
+    # q_layers[layer_id] = q_agg_cpu_tensor (GQA-aggregated: [seq_len, num_kv_heads, head_dim])
     q_layers: List[torch.Tensor] = field(default_factory=list)
     ref_count: int = 0
 

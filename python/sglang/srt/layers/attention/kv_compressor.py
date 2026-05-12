@@ -293,6 +293,10 @@ class SnapKVStyleCompressor(BaseKVCompressor):
     - Select important tokens based on attention patterns for each head
     - Apply maxpool to reduce noise
     - Each attention head has its own compression indices
+    
+    Query is expected to be pre-aggregated along the GQA group dimension
+    before being passed to this compressor. The input query shape is
+    [window_size, num_kv_heads, head_dim] (already aggregated).
     """
     
     def __init__(self, config: CompressionConfig):
@@ -317,11 +321,14 @@ class SnapKVStyleCompressor(BaseKVCompressor):
         Args:
             k: Key tensor [seq_len, num_kv_heads, head_dim]
             v: Value tensor [seq_len, num_kv_heads, head_dim]
-            query: Query tensor [seq_len, num_heads, head_dim]
+            query: GQA-aggregated query tensor [window_size, num_kv_heads, head_dim].
+                   This is the sum of all Q heads within each GQA group for the
+                   observation window. The caller is responsible for performing
+                   the aggregation before calling this method.
         
         Returns:
-            compressed_k: Compressed key tensor [num_tokens_to_keep, num_kv_heads, head_dim]
-            compressed_v: Compressed value tensor [num_tokens_to_keep, num_kv_heads, head_dim]
+            compressed_k: None (not used, gather done externally)
+            compressed_v: None (not used, gather done externally)
             keep_indices: Indices to keep per head [num_kv_heads, num_tokens_to_keep]
         """
         seq_len = k.shape[0]
@@ -342,61 +349,53 @@ class SnapKVStyleCompressor(BaseKVCompressor):
             window_size = num_tokens_to_keep
 
         if attention_scores is None and query is not None:
-            num_heads = query.shape[1]
+            # query is already GQA-aggregated: [window_size, num_kv_heads, head_dim]
             q_head_dim = query.shape[2]
-            kv_group_num = num_heads // num_kv_heads
             
-            q_window = query[-window_size:]
-            k_prefix = k[:-window_size]
+            # Use the provided window or the query length (whichever is smaller)
+            actual_window = min(window_size, query.shape[0])
+            q_window = query[-actual_window:]
+            k_prefix = k[:-actual_window] if actual_window < seq_len else k[:0]
             
             if k_prefix.shape[0] == 0:
                 keep_indices = torch.arange(seq_len, device=k.device).unsqueeze(0).expand(num_kv_heads, -1)
             else:
-                # q_t: [num_heads, window_size, head_dim]
-                q_t = q_window.transpose(0, 1).contiguous()
+                # q_agg: [num_kv_heads, window_size, head_dim]
+                q_agg = q_window.transpose(0, 1).contiguous()
                 # k_t: [num_kv_heads, prefix_len, head_dim]
                 k_t = k_prefix.transpose(0, 1).contiguous()
                 
-                # Optimized GQA: reshape Q instead of expanding K
-                # q_t: [num_heads, window, dim] → [kv_heads, group*window, dim]
-                # Then bmm with k_t: [kv_heads, prefix_len, dim]
-                # Result: [kv_heads, group*window, prefix_len] → sum → [kv_heads, prefix_len]
-                q_grouped = q_t.view(num_kv_heads, kv_group_num * window_size, q_head_dim)
-                attn_weights = torch.bmm(q_grouped, k_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
-                # attn_weights: [kv_heads, group*window, prefix_len]
-                torch.cuda.current_stream().synchronize()
+                # Direct bmm: aggregated Q × K^T
+                # Result: [num_kv_heads, window_size, prefix_len]
+                attn_weights = torch.bmm(q_agg, k_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
 
                 if self.apply_causal_mask:
-                    k_window = k[-window_size:]
+                    k_window = k[-actual_window:]
                     # k_window_t: [num_kv_heads, window_size, head_dim]
                     k_window_t = k_window.transpose(0, 1).contiguous()
                     
-                    # Same optimization for window attention
-                    attn_weights_window = torch.bmm(q_grouped, k_window_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
+                    # Window attention with aggregated Q
+                    attn_weights_window = torch.bmm(q_agg, k_window_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
 
-                    q_window_len = q_window.shape[0]
-                    k_window_len = k_window.shape[0]
-                    # Causal mask for [q_window_len, k_window_len], then tile for groups
+                    q_window_len = actual_window
+                    k_window_len = actual_window
+                    # Causal mask for [window_size, window_size]
                     causal_mask_base = torch.triu(
                         torch.full((q_window_len, k_window_len), float('-inf'), device=k.device, dtype=attn_weights_window.dtype),
                         diagonal=1 + k_window_len - q_window_len
                     )
-                    # attn_weights_window: [kv_heads, group*window, k_window_len]
-                    # causal_mask needs shape [group*window, k_window_len] — tile the mask for each group
-                    causal_mask = causal_mask_base.repeat(kv_group_num, 1)  # [group*window, k_window_len]
-                    attn_weights_window = attn_weights_window + causal_mask.unsqueeze(0)
+                    attn_weights_window = attn_weights_window + causal_mask_base.unsqueeze(0)
                     
                     attn_weights_full = torch.cat([attn_weights, attn_weights_window], dim=-1)
                     
-                    # attention_scores = F.softmax(attn_weights_full, dim=-1, dtype=torch.float32).to(query.dtype)
                     attention_scores = attn_weights_full
                     attn_weights_prefix = attention_scores[:, :, :k_prefix.shape[0]]
                 else:
                     attention_scores = F.softmax(attn_weights, dim=-1)
                     attn_weights_prefix = attention_scores
                 
-                # attn_weights_prefix: [kv_heads, group*window, prefix_len]
-                # Sum over group*window dimension → [kv_heads, prefix_len]
+                # attn_weights_prefix: [num_kv_heads, window_size, prefix_len]
+                # Sum over window dimension → [num_kv_heads, prefix_len]
                 attn_weights_sum = attn_weights_prefix.sum(dim=1)
                 
                 if attn_weights_sum.shape[-1] > self.kernel_size:
@@ -417,22 +416,17 @@ class SnapKVStyleCompressor(BaseKVCompressor):
                 else:
                     attn_cache = attn_weights_sum
                 
-                _, indices = attn_cache.topk(num_tokens_to_keep - window_size, dim=-1)
+                _, indices = attn_cache.topk(num_tokens_to_keep - actual_window, dim=-1)
                 indices = torch.sort(indices, dim=-1).values
                 
                 window_indices = torch.arange(
-                    seq_len - window_size, seq_len,
+                    seq_len - actual_window, seq_len,
                     device=k.device
                 ).unsqueeze(0).expand(num_kv_heads, -1)
                 
                 keep_indices = torch.cat([indices, window_indices], dim=-1)
         else:
             keep_indices = torch.arange(seq_len, device=k.device).unsqueeze(0).expand(num_kv_heads, -1)
-        
-        # keep_indices = torch.arange(num_tokens_to_keep, device=k.device).unsqueeze(0).expand(num_kv_heads, -1)
-
-        # compressed_k = k[keep_indices]
-        # compressed_v = v[keep_indices]
         
         return None, None, keep_indices
 
