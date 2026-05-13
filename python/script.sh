@@ -1,6 +1,7 @@
 _USE_PINNED_MEMORY=1 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 python -m sglang.launch_server \
-    --model-path ../../../autodl-tmp/Qwen2.5-7B-Instruct/ \
+    --model-path ../../../autodl-tmp/Qwen2.5-32B-Instruct/ \
     --port 30000 \
+    --tp 2 \
     --disable-cuda-graph \
     --mem-fraction-static 0.55 \
     --disable-radix-cache \
@@ -9,5 +10,4 @@ _USE_PINNED_MEMORY=1 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 python -m sglan
     --chunked-prefill-size -1 \
     --max-prefill-tokens 508000 \
     --context-length 508000 \
-    --attention-backend compressed_fa3 \
-    --kv-compression-ratio 0.1
+    --attention-backend fa3 

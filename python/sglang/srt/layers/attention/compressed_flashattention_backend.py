@@ -151,6 +151,43 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                 logger.info("[KV Compress] Created global PrefixCPUCache (max_entries=64)")
         self.save_prefix_to_cpu: bool = True
 
+        # Initialize pinned staging buffers for fast D2H transfers.
+        # Uses model config from runner to determine buffer dimensions.
+        from sglang.srt.mem_cache.prefix_cpu_cache import _USE_PINNED_MEMORY as _use_pinned
+        if self.cpu_prefix_cache is not None and _use_pinned:
+            try:
+                _model_config = getattr(runner, 'model_config', None)
+                _max_total_tokens = getattr(runner, 'max_total_num_tokens', 0)
+                # Use context_len or max_prefill_tokens as the max staging size
+                _max_staging = min(
+                    getattr(server_args, 'context_length', 131072),
+                    _max_total_tokens if _max_total_tokens > 0 else 131072,
+                )
+                _num_kv_heads = runner.tp_size  # fallback
+                _head_dim = 128  # fallback
+                if _model_config is not None:
+                    _num_kv_heads = getattr(_model_config, 'num_key_value_heads', 4)
+                    _head_dim = getattr(_model_config, 'head_dim', 128)
+                    # Adjust for tensor parallelism
+                    _tp_size = getattr(runner, 'tp_size', 1)
+                    _num_kv_heads = _num_kv_heads // _tp_size
+
+                _dtype = torch.bfloat16  # Match model dtype
+                if hasattr(runner, 'dtype'):
+                    _dtype = runner.dtype
+
+                self.cpu_prefix_cache.init_staging_buffers(
+                    max_tokens=_max_staging,
+                    num_kv_heads=_num_kv_heads,
+                    head_dim=_head_dim,
+                    dtype=_dtype,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[KV Compress] Failed to init pinned staging buffers: {e}. "
+                    "Falling back to per-call allocation."
+                )
+
         self._compression_stats = {
             "total_compressed": 0,
             "total_freed": 0,
