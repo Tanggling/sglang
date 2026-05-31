@@ -294,9 +294,9 @@ class SnapKVStyleCompressor(BaseKVCompressor):
     - Apply maxpool to reduce noise
     - Each attention head has its own compression indices
     
-    Query is expected to be pre-aggregated along the GQA group dimension
-    before being passed to this compressor. The input query shape is
-    [window_size, num_kv_heads, head_dim] (already aggregated).
+    Query is expected to contain per-query-head activations for the current
+    observation window. The input query shape is
+    [min(window_size, extend_len), num_heads, head_dim].
     """
     
     def __init__(self, config: CompressionConfig):
@@ -321,10 +321,8 @@ class SnapKVStyleCompressor(BaseKVCompressor):
         Args:
             k: Key tensor [seq_len, num_kv_heads, head_dim]
             v: Value tensor [seq_len, num_kv_heads, head_dim]
-            query: GQA-aggregated query tensor [window_size, num_kv_heads, head_dim].
-                   This is the sum of all Q heads within each GQA group for the
-                   observation window. The caller is responsible for performing
-                   the aggregation before calling this method.
+            query: Query tensor [window_tokens, num_heads, head_dim] for the
+                   current extend observation window.
         
         Returns:
             compressed_k: None (not used, gather done externally)
@@ -342,6 +340,9 @@ class SnapKVStyleCompressor(BaseKVCompressor):
 
         num_tokens_to_keep = min(num_tokens_to_keep, seq_len)
         
+        if query is not None and query.shape[0] < 1:
+            raise ValueError("SnapKV compression requires at least one query token")
+
         window_size = min(self.config.window_size, seq_len)
 
         # Ensure window fits within num_tokens_to_keep
@@ -349,8 +350,14 @@ class SnapKVStyleCompressor(BaseKVCompressor):
             window_size = num_tokens_to_keep
 
         if attention_scores is None and query is not None:
-            # query is already GQA-aggregated: [window_size, num_kv_heads, head_dim]
+            # query is [window_tokens, num_heads, head_dim]
             q_head_dim = query.shape[2]
+            num_q_heads = query.shape[1]
+            if num_q_heads % num_kv_heads != 0:
+                raise ValueError(
+                    f"num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+                )
+            kv_group_size = num_q_heads // num_kv_heads
             
             # Use the provided window or the query length (whichever is smaller)
             actual_window = min(window_size, query.shape[0])
@@ -360,22 +367,27 @@ class SnapKVStyleCompressor(BaseKVCompressor):
             if k_prefix.shape[0] == 0:
                 keep_indices = torch.arange(seq_len, device=k.device).unsqueeze(0).expand(num_kv_heads, -1)
             else:
-                # q_agg: [num_kv_heads, window_size, head_dim]
-                q_agg = q_window.transpose(0, 1).contiguous()
+                q_grouped = q_window.view(actual_window, num_kv_heads, kv_group_size, q_head_dim)
+                q_grouped = q_grouped.permute(1, 2, 0, 3).contiguous()
+
                 # k_t: [num_kv_heads, prefix_len, head_dim]
                 k_t = k_prefix.transpose(0, 1).contiguous()
-                
-                # Direct bmm: aggregated Q × K^T
-                # Result: [num_kv_heads, window_size, prefix_len]
-                attn_weights = torch.bmm(q_agg, k_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
+
+                # Compute per-query-head logits before any reduction.
+                # Result: [num_kv_heads, kv_group_size, window_size, prefix_len]
+                attn_weights = torch.einsum(
+                    "hgtd,hpd->hgtp", q_grouped, k_t
+                ) / math.sqrt(q_head_dim)
 
                 if self.apply_causal_mask:
                     k_window = k[-actual_window:]
                     # k_window_t: [num_kv_heads, window_size, head_dim]
                     k_window_t = k_window.transpose(0, 1).contiguous()
                     
-                    # Window attention with aggregated Q
-                    attn_weights_window = torch.bmm(q_agg, k_window_t.transpose(-2, -1)) / math.sqrt(q_head_dim)
+                    # Window attention per query head.
+                    attn_weights_window = torch.einsum(
+                        "hgtd,hwd->hgtw", q_grouped, k_window_t
+                    ) / math.sqrt(q_head_dim)
 
                     q_window_len = actual_window
                     k_window_len = actual_window
@@ -384,19 +396,18 @@ class SnapKVStyleCompressor(BaseKVCompressor):
                         torch.full((q_window_len, k_window_len), float('-inf'), device=k.device, dtype=attn_weights_window.dtype),
                         diagonal=1 + k_window_len - q_window_len
                     )
-                    attn_weights_window = attn_weights_window + causal_mask_base.unsqueeze(0)
+                    attn_weights_window = attn_weights_window + causal_mask_base.unsqueeze(0).unsqueeze(0)
                     
                     attn_weights_full = torch.cat([attn_weights, attn_weights_window], dim=-1)
-                    
-                    attention_scores = attn_weights_full
-                    attn_weights_prefix = attention_scores[:, :, :k_prefix.shape[0]]
+                    attention_scores = F.softmax(attn_weights_full, dim=-1)
+                    attn_weights_prefix = attention_scores[:, :, :, :k_prefix.shape[0]]
                 else:
                     attention_scores = F.softmax(attn_weights, dim=-1)
                     attn_weights_prefix = attention_scores
                 
-                # attn_weights_prefix: [num_kv_heads, window_size, prefix_len]
-                # Sum over window dimension → [num_kv_heads, prefix_len]
-                attn_weights_sum = attn_weights_prefix.sum(dim=1)
+                # attn_weights_prefix: [num_kv_heads, kv_group_size, window_size, prefix_len]
+                # Sum softmaxed per-token/per-query-head scores into KV-head scores.
+                attn_weights_sum = attn_weights_prefix.sum(dim=(1, 2))
                 
                 if attn_weights_sum.shape[-1] > self.kernel_size:
                     if self.pooling == 'maxpool':

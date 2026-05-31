@@ -191,6 +191,10 @@ class SchedulePolicy:
 
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
+            # Leave at least one token as extend so the model can produce logits
+            # and downstream backends (e.g., compressed_fa3) always see extend_len >= 1.
+            if len(prefix_ids) > 0:
+                prefix_ids = prefix_ids[: len(prefix_ids) - 1]
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
             match_result = self.tree_cache.match_prefix(

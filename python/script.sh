@@ -10,4 +10,4 @@ _USE_PINNED_MEMORY=1 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 python -m sglan
     --max-prefill-tokens 508000 \
     --context-length 508000 \
     --attention-backend compressed_fa3 \
-    --kv-compression-ratio 0.1
+    --kv-compression-ratio 0.5

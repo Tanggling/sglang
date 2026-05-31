@@ -63,17 +63,13 @@ def get_global_cpu_prefix_cache() -> Optional["PrefixCPUCache"]:
 @dataclass
 class CPUKVEntry:
     """
-    CPU-side storage for full (uncompressed) KV **and GQA-aggregated Q** data of a prefix.
+    CPU-side storage for full (uncompressed) KV data of a prefix.
 
     Fields:
         token_ids:  The prefix token IDs used as cache key (for collision detection)
         seq_len:    Number of prefix tokens
         kv_layers:  List of (k_cpu, v_cpu) per layer.
                     Each tensor shape: [seq_len, num_kv_heads, head_dim] on CPU
-        q_layers:   List of q_agg_cpu per layer.
-                    Each tensor shape: [seq_len, num_kv_heads, head_dim] on CPU.
-                    This is the GQA-aggregated query (sum over group dimension).
-                    Used to pad short queries during compression importance estimation.
         ref_count:  Number of active requests currently using this entry
     """
 
@@ -81,8 +77,6 @@ class CPUKVEntry:
     seq_len: int
     # kv_layers[layer_id] = (k_cpu_tensor, v_cpu_tensor)
     kv_layers: List[Tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
-    # q_layers[layer_id] = q_agg_cpu_tensor (GQA-aggregated: [seq_len, num_kv_heads, head_dim])
-    q_layers: List[torch.Tensor] = field(default_factory=list)
     ref_count: int = 0
 
     def mem_usage_bytes(self) -> int:
@@ -91,8 +85,6 @@ class CPUKVEntry:
         for k_cpu, v_cpu in self.kv_layers:
             total += k_cpu.numel() * k_cpu.element_size()
             total += v_cpu.numel() * v_cpu.element_size()
-        for q_cpu in self.q_layers:
-            total += q_cpu.numel() * q_cpu.element_size()
         return total
 
 
@@ -104,7 +96,7 @@ class PrefixCPUCache:
         cache = PrefixCPUCache(max_entries=64)
 
         # During first request's prefill (call once per layer):
-        cache.accumulate_layer_kqv(request_id, layer_id, k_gpu, v_gpu, q_gpu)
+        cache.accumulate_layer_kv(request_id, layer_id, k_gpu, v_gpu)
 
         # After all layers of first request's prefill complete:
         cache.finalize_entry(request_id, token_ids)
@@ -144,13 +136,9 @@ class PrefixCPUCache:
         # ------------------------------------------------------------------ #
         # These buffers are allocated once and reused across requests to avoid
         # the expensive per-layer pinned memory allocation during prefill.
-        # They are sized to hold one layer's K, V, Q for the maximum expected
+        # They are sized to hold one layer's K and V for the maximum expected
         # sequence length. The actual data is copied out to regular (non-pinned)
         # CPU tensors after the D2H transfer completes.
-        #
-        # Layout: _pinned_staging[i] = (k_buf, v_buf, q_buf) for slot i
-        # We keep num_staging_slots sets to support concurrent requests.
-        self._pinned_staging: List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = []
         self._staging_max_tokens: int = 0
         self._staging_initialized: bool = False
 
@@ -171,14 +159,14 @@ class PrefixCPUCache:
         Call this once after model config is known (e.g., during backend init).
         This avoids the expensive per-layer pinned memory allocation during prefill.
 
-        The staging buffer holds one layer's worth of K, V, Q_agg data.
-        During accumulate_layer_kqv, data is first copied into the staging buffer
+        The staging buffer holds one layer's worth of K and V data.
+        During accumulate_layer_kv, data is first copied into the staging buffer
         (fast, since it's pre-pinned), then copied out to a regular CPU tensor
         (fast memcpy, no OS page-lock overhead).
 
         Args:
             max_tokens:   Maximum sequence length to support.
-            num_kv_heads: Number of KV heads (Q is stored as aggregated: num_kv_heads).
+            num_kv_heads: Number of KV heads.
             head_dim:     Head dimension.
             dtype:        Data type for the buffers.
         """
@@ -191,14 +179,13 @@ class PrefixCPUCache:
             )
 
         self._staging_max_tokens = max_tokens
-        # Allocate 3 pinned buffers: K, V, Q_agg (all same shape for simplicity)
+        # Allocate pinned buffers for K and V (same shape for simplicity)
         shape = (max_tokens, num_kv_heads, head_dim)
         self._pinned_k_staging = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
         self._pinned_v_staging = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
-        self._pinned_q_staging = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
         self._staging_initialized = True
 
-        staging_bytes = 3 * self._pinned_k_staging.numel() * self._pinned_k_staging.element_size()
+        staging_bytes = 2 * self._pinned_k_staging.numel() * self._pinned_k_staging.element_size()
         logger.info(
             f"PrefixCPUCache: initialized pinned staging buffers "
             f"(max_tokens={max_tokens}, shape={shape}, "
@@ -213,16 +200,15 @@ class PrefixCPUCache:
         """Begin accumulating KV data for a new prefix entry."""
         self._pending[request_id] = {}
 
-    def accumulate_layer_kqv(
+    def accumulate_layer_kv(
         self,
         request_id: int,
         layer_id: int,
         k: torch.Tensor,
         v: torch.Tensor,
-        q: torch.Tensor,
     ) -> None:
         """
-        Save one layer's full K, V, and Q tensors to CPU during first prefill.
+        Save one layer's full K and V tensors to CPU during first prefill.
 
         If staging buffers are initialized, uses pre-allocated pinned memory
         for the D2H transfer (avoiding expensive per-call pinned allocation),
@@ -233,7 +219,6 @@ class PrefixCPUCache:
             layer_id:   Transformer layer index.
             k:          Key tensor   [seq_len, num_kv_heads, head_dim] (GPU)
             v:          Value tensor [seq_len, num_kv_heads, v_head_dim] (GPU)
-            q:          Query tensor [seq_len, num_kv_heads, head_dim] (GPU, GQA-aggregated)
         """
         if request_id not in self._pending:
             logger.warning(
@@ -249,10 +234,8 @@ class PrefixCPUCache:
             # Step 1: D2H copy into staging (no allocation, just memcpy via DMA)
             k_staging = self._pinned_k_staging[:seq_len]
             v_staging = self._pinned_v_staging[:seq_len]
-            q_staging = self._pinned_q_staging[:seq_len]
             k_staging.copy_(k, non_blocking=True)
             v_staging.copy_(v, non_blocking=True)
-            q_staging.copy_(q, non_blocking=True)
 
             # Step 2: Copy from staging to regular CPU tensor (CPU→CPU, very fast)
             # We must sync before this copy to ensure D2H is complete.
@@ -267,21 +250,17 @@ class PrefixCPUCache:
                 torch.cuda.current_stream().synchronize()
             k_cpu = k_staging.clone()
             v_cpu = v_staging.clone()
-            q_cpu = q_staging.clone()
         elif _USE_PINNED_MEMORY:
             # Fallback: allocate pinned memory per-call (original behavior)
             k_cpu = torch.empty(k.shape, dtype=k.dtype, device="cpu", pin_memory=True)
             v_cpu = torch.empty(v.shape, dtype=v.dtype, device="cpu", pin_memory=True)
-            q_cpu = torch.empty(q.shape, dtype=q.dtype, device="cpu", pin_memory=True)
             k_cpu.copy_(k, non_blocking=True)
             v_cpu.copy_(v, non_blocking=True)
-            q_cpu.copy_(q, non_blocking=True)
         else:
             k_cpu = k.detach().to("cpu", non_blocking=True)
             v_cpu = v.detach().to("cpu", non_blocking=True)
-            q_cpu = q.detach().to("cpu", non_blocking=True)
 
-        self._pending[request_id][layer_id] = (k_cpu, v_cpu, q_cpu)
+        self._pending[request_id][layer_id] = (k_cpu, v_cpu)
 
     def finalize_entry(self, request_id: int, token_ids) -> Optional[int]:
         """
@@ -291,7 +270,7 @@ class PrefixCPUCache:
         accumulated.
 
         Args:
-            request_id: The request ID used in accumulate_layer_kqv().
+            request_id: The request ID used in accumulate_layer_kv().
             token_ids:  Prefix token IDs (list or Tensor) used as cache key.
 
         Returns:
@@ -314,23 +293,20 @@ class PrefixCPUCache:
 
         h = self._hash_tokens(token_ids)
 
-        # Build kv_layers and q_layers lists in sorted order
+        # Build kv_layers list in sorted order
         num_layers = max(pending_layers.keys()) + 1
         kv_layers = []
-        q_layers = []
         for layer_id in range(num_layers):
             if layer_id not in pending_layers:
                 logger.error(f"PrefixCPUCache: missing layer {layer_id} for request {request_id}")
                 return None
-            k_cpu, v_cpu, q_cpu = pending_layers[layer_id]
+            k_cpu, v_cpu = pending_layers[layer_id]
             kv_layers.append((k_cpu, v_cpu))
-            q_layers.append(q_cpu)
 
         entry = CPUKVEntry(
             token_ids=token_ids,
             seq_len=len(token_ids),
             kv_layers=kv_layers,
-            q_layers=q_layers,
         )
         entry_bytes = entry.mem_usage_bytes()
 
@@ -483,33 +459,6 @@ class PrefixCPUCache:
         k_gpu = k_cpu.to(device, non_blocking=True)
         v_gpu = v_cpu.to(device, non_blocking=True)
         return k_gpu, v_gpu
-
-    def load_query_to_gpu(
-        self,
-        entry: CPUKVEntry,
-        layer_id: int,
-        device: str,
-        start: int = 0,
-        end: Optional[int] = None,
-    ) -> torch.Tensor:
-        """
-        Load stored Q from CPU to GPU for a given layer.
-
-        Args:
-            entry:    CPUKVEntry returned by lookup()
-            layer_id: Transformer layer index
-            device:   Target GPU device string
-            start:    Start token index (inclusive)
-            end:      End token index (exclusive), None = entry.seq_len
-
-        Returns:
-            q_gpu tensor [end-start, num_heads, head_dim] on device
-        """
-        q_cpu = entry.q_layers[layer_id]
-        if end is None:
-            end = q_cpu.shape[0]
-        q_slice = q_cpu[start:end]
-        return q_slice.to(device, non_blocking=False)
 
     # ------------------------------------------------------------------ #
     # Eviction                                                             #

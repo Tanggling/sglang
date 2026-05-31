@@ -346,7 +346,7 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
         q_view = q.view(-1, num_heads, head_dim)
         all_compressed_lens: List[int] = getattr(forward_batch, "_gr_compressed_lens", [])
 
-        # Compressor window size for Q padding
+        # SnapKV observes only the current extend window.
         _window_size = getattr(self.compression_config, 'window_size', 64)
 
         # ── PHASE 1: Assemble full KV in GlobalKVPool ──────────────────────
@@ -421,23 +421,12 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             all_cu_seqlens_k.append(all_cu_seqlens_k[-1] + full_seq_len)
             max_seqlen_k = max(max_seqlen_k, full_seq_len)
 
-            # Save full KV and GQA-aggregated Q to CPU for miss sequences
+            # Save full KV to CPU for miss sequences.
             if do_cpu and seq_idx in cpu_miss_set:
                 import time as _time
                 _finalize_start = _time.perf_counter()
-                
-                # Aggregate Q along GQA group dimension before saving to CPU
-                # q_view[q_start:q_end]: [extend_len, num_heads, head_dim]
-                # → reshape to [extend_len, num_kv_heads, group_size, head_dim]
-                # → sum over group_size → [extend_len, num_kv_heads, head_dim]
-                q_seq_full = q_view[q_start:q_end]
-                _kv_group_num = num_heads // num_kv_heads
-                q_seq_agg = q_seq_full.view(
-                    q_seq_full.shape[0], num_kv_heads, _kv_group_num, head_dim
-                ).sum(dim=2)
-                self.cpu_prefix_cache.accumulate_layer_kqv(
-                    req_id, layer_id, k_full, v_full, q_seq_agg
-                )
+
+                self.cpu_prefix_cache.accumulate_layer_kv(req_id, layer_id, k_full, v_full)
 
                 _finalize_ms = (_time.perf_counter() - _finalize_start) * 1000.0
                 _cm_fin = get_metrics()
@@ -491,37 +480,17 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             req_id = req_pool_indices[seq_idx].item()
             _prefix_len = cpu_prefix_lens.get(seq_idx, 0)
 
-            # ── Build GQA-aggregated Q for compression importance estimation ─
-            _kv_group_num = num_heads // num_kv_heads
-            if _prefix_len > 0 and extend_len < _window_size:
-                # Load pre-aggregated Q from CPU cache (already [tokens, num_kv_heads, head_dim])
-                _req = reqs[seq_idx]
-                _entry = _req.cpu_prefix_entry
-                _need_from_cpu = min(_window_size - extend_len, _prefix_len)
-                _q_pad_agg = self.cpu_prefix_cache.load_query_to_gpu(
-                    _entry, layer_id, str(device),
-                    start=_prefix_len - _need_from_cpu,
-                    end=_prefix_len,
+            if extend_len < 1:
+                raise ValueError(
+                    f"compressed_fa3 requires extend_len >= 1, got {extend_len} for req_id={req_id}"
                 )
-                # _q_pad_agg: [_need_from_cpu, num_kv_heads, head_dim] (already aggregated)
-                if extend_len > 0:
-                    # Aggregate the extend Q on the fly
-                    q_extend_agg = q_view[q_start:q_end].view(
-                        extend_len, num_kv_heads, _kv_group_num, head_dim
-                    ).sum(dim=2)
-                    q_for_compress = torch.cat([_q_pad_agg, q_extend_agg], dim=0)
-                else:
-                    q_for_compress = _q_pad_agg
-            else:
-                # Aggregate Q along GQA group dimension
-                # q_view[q_start:q_end]: [extend_len, num_heads, head_dim]
-                # → [extend_len, num_kv_heads, group_size, head_dim] → sum → [extend_len, num_kv_heads, head_dim]
-                q_for_compress = q_view[q_start:q_end].view(
-                    extend_len, num_kv_heads, _kv_group_num, head_dim
-                ).sum(dim=2)
+
+            # ── Build Q window for compression importance estimation ─
+            q_window_len = min(_window_size, extend_len)
+            q_for_compress = q_view[q_end - q_window_len:q_end]
 
             # ── Compress: select important tokens from the full sequence ──
-            # q_for_compress is now [window_tokens, num_kv_heads, head_dim] (aggregated)
+            # q_for_compress is [min(window_size, extend_len), num_heads, head_dim].
             forward_batch._timer_compress_algo.mark_start()
             _, _, keep_indices = self._estimate_importance(
                 method=self.importance_method,
@@ -771,43 +740,21 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
                     all_compressed_lens.append(None)
                 continue
 
-            # Save full KV and GQA-aggregated Q to CPU for miss sequences
+            # Save full KV to CPU for miss sequences.
             if do_cpu and seq_idx in cpu_miss_set:
-                _kv_group_num = num_heads // num_kv_heads
-                q_seq_agg = q_view[q_start:q_end].view(
-                    extend_len, num_kv_heads, _kv_group_num, head_dim
-                ).sum(dim=2)
-                self.cpu_prefix_cache.accumulate_layer_kqv(
-                    req_id, layer_id, k_full, v_full, q_seq_agg
-                )
+                self.cpu_prefix_cache.accumulate_layer_kv(req_id, layer_id, k_full, v_full)
 
             # ── Build GQA-aggregated Q for compression importance estimation ──
-            _kv_group_num = num_heads // num_kv_heads
-            if _prefix_slots is not None and extend_len < _window_size:
-                # Load pre-aggregated Q from CPU cache (already [tokens, num_kv_heads, head_dim])
-                _req = reqs[seq_idx]
-                _entry = _req.cpu_prefix_entry
-                _match_len = _prefix_slots.shape[0]
-                _need_from_cpu = min(_window_size - extend_len, _match_len)
-                _q_pad_agg = self.cpu_prefix_cache.load_query_to_gpu(
-                    _entry, layer_id, str(device),
-                    start=_match_len - _need_from_cpu,
-                    end=_match_len,
+            if extend_len < 1:
+                raise ValueError(
+                    f"compressed_fa3 requires extend_len >= 1, got {extend_len} for req_id={req_id}"
                 )
-                if extend_len > 0:
-                    q_extend_agg = q_view[q_start:q_end].view(
-                        extend_len, num_kv_heads, _kv_group_num, head_dim
-                    ).sum(dim=2)
-                    q_for_compress = torch.cat([_q_pad_agg, q_extend_agg], dim=0)
-                else:
-                    q_for_compress = _q_pad_agg
-            else:
-                q_for_compress = q_view[q_start:q_end].view(
-                    extend_len, num_kv_heads, _kv_group_num, head_dim
-                ).sum(dim=2)
+
+            q_window_len = min(_window_size, extend_len)
+            q_for_compress = q_view[q_end - q_window_len:q_end]
 
             # ── Compress: select important tokens from the full sequence ───
-            # q_for_compress: [window_tokens, num_kv_heads, head_dim] (aggregated)
+            # q_for_compress: [min(window_size, extend_len), num_heads, head_dim]
             _, _, keep_indices = self._estimate_importance(
                 method=self.importance_method,
                 q=q_for_compress,
@@ -1173,13 +1120,17 @@ class CompressedFlashAttentionBackend(FlashAttentionBackend):
             k_seq = k[start_idx:end_idx]
             v_seq = v[start_idx:end_idx]
 
-            # Aggregate Q along GQA group dimension before compression
-            _kv_group_num = num_heads // num_kv_heads
-            q_seq_agg = q_seq.view(seq_len, num_kv_heads, _kv_group_num, head_dim).sum(dim=2)
+            if seq_len < 1:
+                raise ValueError("compressed_fa3 requires seq_len >= 1")
+
+            # Use the recent query window directly. SnapKV computes attention per
+            # query head/token before grouping scores by KV head.
+            q_window_len = min(getattr(self.compression_config, 'window_size', 64), seq_len)
+            q_seq_window = q_seq[-q_window_len:]
 
             compressed_k_seq, compressed_v_seq, keep_indices = self._estimate_importance(
                 method=self.importance_method,
-                q=q_seq_agg,
+                q=q_seq_window,
                 k=k_seq,
                 v=v_seq,
                 num_heads=num_kv_heads,
