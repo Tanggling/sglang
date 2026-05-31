@@ -139,6 +139,72 @@ class PrefixCPUCache:
 
         self._total_bytes = 0
 
+        # ------------------------------------------------------------------ #
+        # Pre-allocated pinned memory staging buffers                          #
+        # ------------------------------------------------------------------ #
+        # These buffers are allocated once and reused across requests to avoid
+        # the expensive per-layer pinned memory allocation during prefill.
+        # They are sized to hold one layer's K, V, Q for the maximum expected
+        # sequence length. The actual data is copied out to regular (non-pinned)
+        # CPU tensors after the D2H transfer completes.
+        #
+        # Layout: _pinned_staging[i] = (k_buf, v_buf, q_buf) for slot i
+        # We keep num_staging_slots sets to support concurrent requests.
+        self._pinned_staging: List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = []
+        self._staging_max_tokens: int = 0
+        self._staging_initialized: bool = False
+
+    # ------------------------------------------------------------------ #
+    # Pre-allocated pinned staging buffer management                       #
+    # ------------------------------------------------------------------ #
+
+    def init_staging_buffers(
+        self,
+        max_tokens: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        """
+        Pre-allocate pinned memory staging buffers for D2H transfers.
+
+        Call this once after model config is known (e.g., during backend init).
+        This avoids the expensive per-layer pinned memory allocation during prefill.
+
+        The staging buffer holds one layer's worth of K, V, Q_agg data.
+        During accumulate_layer_kqv, data is first copied into the staging buffer
+        (fast, since it's pre-pinned), then copied out to a regular CPU tensor
+        (fast memcpy, no OS page-lock overhead).
+
+        Args:
+            max_tokens:   Maximum sequence length to support.
+            num_kv_heads: Number of KV heads (Q is stored as aggregated: num_kv_heads).
+            head_dim:     Head dimension.
+            dtype:        Data type for the buffers.
+        """
+        if self._staging_initialized:
+            if max_tokens <= self._staging_max_tokens:
+                return  # Already initialized with sufficient size
+            logger.info(
+                f"PrefixCPUCache: re-initializing staging buffers "
+                f"({self._staging_max_tokens} → {max_tokens} tokens)"
+            )
+
+        self._staging_max_tokens = max_tokens
+        # Allocate 3 pinned buffers: K, V, Q_agg (all same shape for simplicity)
+        shape = (max_tokens, num_kv_heads, head_dim)
+        self._pinned_k_staging = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+        self._pinned_v_staging = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+        self._pinned_q_staging = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+        self._staging_initialized = True
+
+        staging_bytes = 3 * self._pinned_k_staging.numel() * self._pinned_k_staging.element_size()
+        logger.info(
+            f"PrefixCPUCache: initialized pinned staging buffers "
+            f"(max_tokens={max_tokens}, shape={shape}, "
+            f"size={staging_bytes / 1024**2:.1f} MB)"
+        )
+
     # ------------------------------------------------------------------ #
     # Building entries (during first prefill)                              #
     # ------------------------------------------------------------------ #
@@ -158,15 +224,16 @@ class PrefixCPUCache:
         """
         Save one layer's full K, V, and Q tensors to CPU during first prefill.
 
-        Q is stored so that future CPU-hit requests with short queries can pad
-        their Q with the stored Q to reach the compressor's window_size.
+        If staging buffers are initialized, uses pre-allocated pinned memory
+        for the D2H transfer (avoiding expensive per-call pinned allocation),
+        then copies to a regular CPU tensor for long-term storage.
 
         Args:
             request_id: Unique identifier for the in-flight request.
             layer_id:   Transformer layer index.
             k:          Key tensor   [seq_len, num_kv_heads, head_dim] (GPU)
             v:          Value tensor [seq_len, num_kv_heads, v_head_dim] (GPU)
-            q:          Query tensor [seq_len, num_heads, head_dim] (GPU)
+            q:          Query tensor [seq_len, num_kv_heads, head_dim] (GPU, GQA-aggregated)
         """
         if request_id not in self._pending:
             logger.warning(
@@ -175,7 +242,34 @@ class PrefixCPUCache:
             )
             return
 
-        if _USE_PINNED_MEMORY:
+        seq_len = k.shape[0]
+
+        if _USE_PINNED_MEMORY and self._staging_initialized and seq_len <= self._staging_max_tokens:
+            # Fast path: use pre-allocated pinned staging buffers
+            # Step 1: D2H copy into staging (no allocation, just memcpy via DMA)
+            k_staging = self._pinned_k_staging[:seq_len]
+            v_staging = self._pinned_v_staging[:seq_len]
+            q_staging = self._pinned_q_staging[:seq_len]
+            k_staging.copy_(k, non_blocking=True)
+            v_staging.copy_(v, non_blocking=True)
+            q_staging.copy_(q, non_blocking=True)
+
+            # Step 2: Copy from staging to regular CPU tensor (CPU→CPU, very fast)
+            # We must sync before this copy to ensure D2H is complete.
+            # But we defer sync to finalize_entry() for all layers at once.
+            # So we clone from staging — clone is safe because staging won't be
+            # reused until next layer's accumulate call (which happens after this).
+            # Actually, since layers are processed sequentially and staging is
+            # overwritten each layer, we need to copy out immediately.
+            # Use non_blocking D2H + immediate clone from pinned → regular CPU.
+            # The clone will wait for the copy_ to finish on the same stream.
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().synchronize()
+            k_cpu = k_staging.clone()
+            v_cpu = v_staging.clone()
+            q_cpu = q_staging.clone()
+        elif _USE_PINNED_MEMORY:
+            # Fallback: allocate pinned memory per-call (original behavior)
             k_cpu = torch.empty(k.shape, dtype=k.dtype, device="cpu", pin_memory=True)
             v_cpu = torch.empty(v.shape, dtype=v.dtype, device="cpu", pin_memory=True)
             q_cpu = torch.empty(q.shape, dtype=q.dtype, device="cpu", pin_memory=True)
@@ -186,6 +280,7 @@ class PrefixCPUCache:
             k_cpu = k.detach().to("cpu", non_blocking=True)
             v_cpu = v.detach().to("cpu", non_blocking=True)
             q_cpu = q.detach().to("cpu", non_blocking=True)
+
         self._pending[request_id][layer_id] = (k_cpu, v_cpu, q_cpu)
 
     def finalize_entry(self, request_id: int, token_ids) -> Optional[int]:
